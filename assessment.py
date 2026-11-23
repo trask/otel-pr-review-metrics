@@ -16,6 +16,8 @@ from prepared import PreparedEvidence
 
 KINDS = ("bug", "test coverage gap", "improvement")
 OUTCOMES = ("addressed", "unaddressed", "unclear", "duplicate", "other")
+DEFAULT_REASONING_EFFORT = "high"
+REASONING_EFFORTS = ("medium", "high")
 MAX_PATHS = 4
 MAX_COMMITS = 12
 MAX_INPUT = 180_000
@@ -76,15 +78,19 @@ class AssessmentError(DataError):
 
 
 class Copilot:
-    def __init__(self, model):
+    def __init__(self, model, reasoning_effort=DEFAULT_REASONING_EFFORT):
         self.model = model
+        self.reasoning_effort = reasoning_effort
 
     def ask(self, instructions, data):
+        if self.reasoning_effort not in REASONING_EFFORTS:
+            raise AssessmentError("Assessment requires a pinned reasoning effort")
         prompt = instructions.strip() + "\n\nEvidence JSON:\n" + json.dumps(data, ensure_ascii=False)
         if len(prompt.encode("utf-8")) > MAX_INPUT:
             raise AssessmentError("Evidence exceeds the model input budget")
         args = [
-            "copilot", "--model", self.model, "--available-tools=scorecard_no_tools",
+            "copilot", "--model", self.model, "--reasoning-effort", self.reasoning_effort,
+            "--available-tools=scorecard_no_tools",
             "--deny-tool=shell", "--deny-tool=write", "--deny-tool=url",
             "--disable-builtin-mcps", "--no-custom-instructions", "--no-ask-user",
             "--sync-session=off", "--no-auto-update", "--no-color", "--stream=off",

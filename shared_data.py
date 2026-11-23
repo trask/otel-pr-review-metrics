@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from archive import decode, encode
-from assessment import KINDS, OUTCOMES
+from assessment import KINDS, OUTCOMES, REASONING_EFFORTS
 from github_data import DataError, instant, run_command
 from git_evidence import object_id
 from prepared import PREPARED_VERSION, digest, json_bytes
@@ -96,8 +96,9 @@ def safe_payload(payload):
     return all(map(safe, strings(data)))
 
 
-def judgment_key(model, inputs):
-    return sha256(json.dumps([model, inputs], sort_keys=True).encode()).hexdigest()
+def judgment_key(model, inputs, reasoning_effort=None):
+    parts = [model, inputs] if reasoning_effort is None else [model, reasoning_effort, inputs]
+    return sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
 
 
 def public_assessment(pull, result, key, *, bundle=None):
@@ -109,7 +110,10 @@ def public_assessment(pull, result, key, *, bundle=None):
         invalid()
     if not isinstance(model, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}", model):
         invalid()
-    if key != judgment_key(model, [version, pull, evidence]):
+    effort = result.get("reasoning_effort")
+    if "reasoning_effort" in result and effort not in REASONING_EFFORTS:
+        invalid()
+    if key != judgment_key(model, [version, pull, evidence], effort):
         invalid()
 
     threads, rows = pull["threads"], result.get("threads")
@@ -147,8 +151,11 @@ def public_assessment(pull, result, key, *, bundle=None):
                     invalid()
             decision["evidence"] = links
         decisions.append(decision)
-    return {"input_digest": key, "assessment_version": version, "evidence_digest": evidence,
-            "model": model, "threads": decisions}
+    record = {"input_digest": key, "assessment_version": version, "evidence_digest": evidence,
+              "model": model, "threads": decisions}
+    if effort is not None:
+        record["reasoning_effort"] = effort
+    return record
 
 
 class SharedData:

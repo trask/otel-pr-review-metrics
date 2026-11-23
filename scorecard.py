@@ -13,7 +13,7 @@ from string import Template
 from subprocess import TimeoutExpired
 
 from archive import DEFAULT_ARCHIVE, Archive, ArchivedGitHub
-from assessment import KINDS, OUTCOMES, Copilot, Evidence, assess
+from assessment import DEFAULT_REASONING_EFFORT, KINDS, OUTCOMES, REASONING_EFFORTS, Copilot, Evidence, assess
 from github_data import DataError, GitHub
 from prepared import digest, prepare
 from shared_data import SharedData, judgment_key
@@ -199,7 +199,7 @@ class Cohort:
         return f"{self.name} | {self.dates[0]} to {self.dates[1]} UTC"
 
 
-def render(cohorts, custom, model, version=ASSESSMENT_VERSION):
+def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=DEFAULT_REASONING_EFFORT):
     overview, main, types, threads = [], [], [], []
     for window in cohorts:
         stats = window.total
@@ -221,7 +221,8 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION):
                      "The Automated total uses GitHub Copilot only.")
     return Template(TEMPLATE.read_text(encoding="utf-8")).substitute(
         overview="".join(overview), main="".join(main), types="".join(types),
-        threads="".join(threads), identity_note=escape(identity_note), model=escape(model),
+        threads="".join(threads), identity_note=escape(identity_note),
+        model=escape(f"{model} ({reasoning_effort or 'unpinned'} reasoning effort)"),
         version=escape(version[:12]),
     )
 
@@ -237,12 +238,12 @@ def assess_cached(archive, bundle, model, pull, audit, allow_model, version):
     repo, number = pull["repo"], pull["number"]
 
     def fingerprint(inputs):
-        return judgment_key(model.model, inputs)
+        return judgment_key(model.model, inputs, model.reasoning_effort)
 
     key = fingerprint([version, pull, digest(bundle)])
     saved = (archive.get_judgment(repo, number, "published", key)
              or archive.get_judgment(repo, number, "complete", key))
-    if saved is None and not allow_model and version != ASSESSMENT_VERSION:
+    if saved is None and not allow_model and model.reasoning_effort is None and version != ASSESSMENT_VERSION:
         saved = archive.get_judgment(repo, number, "complete", fingerprint([version, pull]))
     if saved is not None:
         return saved["threads"], False
@@ -260,7 +261,8 @@ def assess_cached(archive, bundle, model, pull, audit, allow_model, version):
     rows = assess(bundle, model, pull, checkpoint)
     result = {
         "input_digest": key, "assessment_version": version,
-        "model": model.model, "merge": pull["merge"], "evidence_digest": digest(bundle), "threads": rows,
+        "model": model.model, "reasoning_effort": model.reasoning_effort,
+        "merge": pull["merge"], "evidence_digest": digest(bundle), "threads": rows,
     }
     write_atomic(audit / repo / str(number) / f"{key}.json", json.dumps(result, indent=2) + "\n")
     archive.put_judgment(repo, number, "complete", key, result)
@@ -350,6 +352,9 @@ def main(argv=None):
             options.add_argument("--custom-reviewer", action="append", default=[], metavar="LOGIN")
             options.add_argument("--other-bot", action="append", default=[], metavar="LOGIN")
             options.add_argument("--model", default="gpt-6.2-sol", help="GitHub Copilot CLI model ID (default: %(default)s)")
+            efforts = (*REASONING_EFFORTS, "unpinned") if command == "report" else REASONING_EFFORTS
+            options.add_argument("--reasoning-effort", choices=efforts, default=DEFAULT_REASONING_EFFORT,
+                                 help="reasoning effort for the assessment (default: %(default)s)")
             options.add_argument("--output", type=Path, default=Path(".scorecard", "scorecard.html"))
             if command == "assess":
                 options.add_argument("--audit-dir", type=Path, default=None)
@@ -431,17 +436,18 @@ def main(argv=None):
         windows.append(("Follow-up", (start, end)))
     try:
         publish = args.command == "assess" and args.publish_data
+        effort = None if args.reasoning_effort == "unpinned" else args.reasoning_effort
         if not args.archive.is_file() and not publish:
             raise DataError("Archive does not exist. Run `python scorecard.py load-data` or `capture` first.")
         with closing(Archive(args.archive, readonly=args.command == "report")) as archive:
             shared = load_shared(archive, args) if publish else None
-            cohorts, failures = collect(archive, args, Copilot(args.model), windows, shared)
+            cohorts, failures = collect(archive, args, Copilot(args.model, effort), windows, shared)
             if shared is not None:
                 publish_shared(shared, args)
     except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
         log(str(error))
         return 1
-    write_atomic(args.output, render(cohorts, args.custom_reviewer, args.model, args.assessment_version))
+    write_atomic(args.output, render(cohorts, args.custom_reviewer, args.model, args.assessment_version, effort))
     print(args.output)
     return int(bool(failures))
 

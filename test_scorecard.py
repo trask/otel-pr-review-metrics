@@ -157,14 +157,19 @@ class CollectionTests(unittest.TestCase):
                     writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                       (repo, 1, day, pull["merged"], encode(pull)))
                 writer.put_prepared(repo, 1, bundle)
-                for version, status in ((old, "unaddressed"), (ASSESSMENT_VERSION, "addressed")):
-                    key = judgment_key(model, [version, pull, digest(bundle)])
+                for version, effort, status in (
+                    (old, None, "unaddressed"), (ASSESSMENT_VERSION, "medium", "unclear"),
+                    (ASSESSMENT_VERSION, "high", "addressed"),
+                ):
+                    key = judgment_key(model, [version, pull, digest(bundle)], effort)
                     result = {"assessment_version": version, "model": model, "evidence_digest": digest(bundle),
                               "threads": [
                                   {"id": "first", "kind": "bug", "status": status, "evidence": [link],
                                    "reason": "Do not publish this model explanation"},
                                   {"id": "duplicate", "kind": None, "status": "duplicate", "original": "first"},
                               ]}
+                    if effort:
+                        result["reasoning_effort"] = effort
                     writer.put_judgment(repo, 1, "complete", key, result)
                 writer.put_judgment(repo, 1, "judge", "partial", {"outcome_reason": "Private intermediate output"})
                 before = publisher.publish()
@@ -179,7 +184,12 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(main(["report", "--archive", str(fresh), *options]), 0)
                 self.assertIn("<td>1</td><td>1.00</td><td>1</td><td>0</td><td>0</td><td>0</td>",
                               html.read_text(encoding="utf-8"))
-                self.assertEqual(main(["report", "--archive", str(fresh), "--assessment-version", old, *options]), 0)
+                self.assertEqual(main(["report", "--archive", str(fresh), "--reasoning-effort", "medium", *options]), 0)
+                self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>0</td><td>0</td><td>0</td>",
+                              html.read_text(encoding="utf-8"))
+                self.assertIn("test-model (medium reasoning effort)", html.read_text(encoding="utf-8"))
+                self.assertEqual(main(["report", "--archive", str(fresh), "--assessment-version", old,
+                                       "--reasoning-effort", "unpinned", *options]), 0)
                 self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>1</td><td>0</td><td>0</td>",
                               html.read_text(encoding="utf-8"))
 
@@ -188,7 +198,8 @@ class CollectionTests(unittest.TestCase):
                 publisher.load()
                 self.assertIsNone(publisher.publish())
                 self.assertEqual(list(reader.db.execute("SELECT stage, count(*) FROM judgments GROUP BY stage")),
-                                 [("published", 2)])
+                                 [("published", 3)])
+                self.assertEqual(reader.get_judgment(repo, 1, "published", key)["reasoning_effort"], "high")
                 self.assertEqual(reader.get_judgment(repo, 1, "published", key)["threads"], [
                     {"id": "first", "kind": "bug", "status": "addressed", "evidence": [link]},
                     {"id": "duplicate", "kind": None, "status": "duplicate", "original": "first"},
@@ -327,7 +338,7 @@ class AssessmentTests(unittest.TestCase):
                     archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                        (pull["repo"], 1, "2026-10-01", pull["merged"], encode(pull)))
                 archive.put_prepared(pull["repo"], 1, bundle)
-            model = Mock(model="test-model")
+            model = Mock(model="test-model", reasoning_effort="high")
             model.ask.side_effect = [
                 [{"id": "thread", "kind": "bug", "paths": [], "reason": "Rejects adults."}],
                 {"status": "unclear", "evidence": ["comparison"], "reason": "Timing is unclear."},
@@ -358,7 +369,7 @@ class AssessmentTests(unittest.TestCase):
 
     def test_changing_outcome_version_keeps_classification_and_old_result(self):
         pull = {"repo": REPOS[0], "number": 1, "merge": "revision"}
-        model = SimpleNamespace(model="model")
+        model = Copilot("model")
         classify_once, judge_v1, judge_v2 = Mock(return_value="bug"), Mock(return_value="unclear"), Mock(
             return_value="addressed"
         )
@@ -380,9 +391,14 @@ class AssessmentTests(unittest.TestCase):
                                      ["bug", "addressed"])
                 self.assertEqual(assess_cached(archive, {}, model, pull, None, False, "old"),
                                  (["bug", "unclear"], False))
-            classify_once.assert_called_once()
+                medium = Copilot("model", "medium")
+                self.assertEqual(assess_cached(archive, {}, medium, pull, None, False, "new"), (None, False))
+                with patch("scorecard.assess", side_effect=run("new-prompt", judge_v2)):
+                    self.assertEqual(assess_cached(archive, {}, medium, pull, root, True, "new")[0],
+                                     ["bug", "addressed"])
+            self.assertEqual(classify_once.call_count, 2)
             judge_v1.assert_called_once()
-            judge_v2.assert_called_once()
+            self.assertEqual(judge_v2.call_count, 2)
 
     def test_duplicate_only_links_earlier_original_and_is_not_a_finding(self):
         threads = [
@@ -422,9 +438,12 @@ class AssessmentTests(unittest.TestCase):
         with patch("github_data.subprocess.run", return_value=SimpleNamespace(
             returncode=0, stdout=stdout,
         )) as run:
-            self.assertEqual(Copilot("model").ask("Classify", {}), {"ok": True})
-        self.assertIn("--available-tools=scorecard_no_tools", run.call_args.args[0])
-        self.assertIn("creationflags", run.call_args.kwargs)
+            for model, effort in ((Copilot("model"), "high"), (Copilot("model", "medium"), "medium")):
+                self.assertEqual(model.ask("Classify", {}), {"ok": True})
+                args = run.call_args.args[0]
+                self.assertEqual(args[args.index("--reasoning-effort") + 1], effort)
+                self.assertIn("--available-tools=scorecard_no_tools", args)
+                self.assertIn("creationflags", run.call_args.kwargs)
 
     def test_missing_comparison_cannot_establish_an_unaddressed_finding(self):
         records = {
