@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from github_data import DataError, GitHubError, blob_url, instant, run_command
 from git_evidence import GitEvidence, GitUnavailable, object_id
+from prepared import PreparedEvidence
 
 
 KINDS = ("bug", "test coverage gap", "improvement")
@@ -30,8 +31,8 @@ Do not count replies as findings. If a later thread clearly flags the same concr
 and needs no separate fix, label it duplicate of the earliest original thread. If the match
 isn't clear, keep both. Threads published at the same time have no established order,
 even if one was drafted earlier. Do not link those threads as duplicates of each other.
-For each original finding, select up to three relevant additional paths from changed_paths
-for the code comparison. Include a renamed path or a related test path when applicable.
+For each original finding, select up to three relevant additional paths from that thread's
+available_paths for the code comparison. Include a renamed path or a related test path when applicable.
 Return only a JSON array in thread order, one object per opener:
 {"id":"...","kind":"bug|test coverage gap|improvement|duplicate|other",
  "original":null,"paths":[],"reason":"short explanation"}
@@ -60,7 +61,9 @@ merged tree can't be placed in time, choose unclear, not unaddressed.
 Choose unaddressed only after checking relevant code in the reviewed revision, the later
 comparison, and the merge and finding no matching change that survived. Cite the reviewed
 and merged file(s) and the net comparison. If required paths, history or code are missing,
-or the evidence does not settle the outcome, choose unclear. Missing patches are not proof
+or the evidence does not settle the outcome, choose unclear. Only the selected paths are
+shown. If the finding requires a path outside the prepared bundle, choose unclear.
+Missing patches are not proof
 that code didn't change. A file listed as absent at a verified revision has no content.
 Return only a JSON object:
 {"status":"addressed|unaddressed|unclear","evidence":["IDs from supplied evidence"],
@@ -133,11 +136,12 @@ def brief(reason):
     return reason.strip()[:1200]
 
 
-def classify(model, pull, changed_paths):
+def classify(model, pull, available_paths):
     threads = pull["threads"]
     rows = model.ask(CLASSIFY, {
-        "threads": [visible_thread(thread) for thread in threads],
-        "changed_paths": sorted(changed_paths),
+        "threads": [dict(visible_thread(thread), available_paths=[
+            path for path in available_paths[thread["id"]] if path != thread["path"]
+        ]) for thread in threads],
     })
     if not isinstance(rows, list) or len(rows) != len(threads):
         raise AssessmentError("Classifier must return one assessment per thread")
@@ -161,7 +165,7 @@ def classify(model, pull, changed_paths):
         else:
             request = row.get("paths")
             if not isinstance(request, list) or len(request) >= MAX_PATHS or any(
-                not isinstance(path, str) or path not in changed_paths for path in request
+                not isinstance(path, str) or path not in available_paths[thread["id"]] for path in request
             ):
                 raise AssessmentError("Classifier requested unexpected file paths")
             originals[thread["id"]] = thread
@@ -305,11 +309,6 @@ class Evidence:
                     paths.add(item["previous_filename"])
         return paths
 
-    def prefetch(self):
-        self.changed_paths()
-        for thread in self.pull["threads"]:
-            self.for_thread(thread, [thread["path"]])
-
     def for_thread(self, thread, paths):
         reviewed = object_id(thread["reviewed"])
         records = {
@@ -408,23 +407,31 @@ def judge(model, pull, thread, finding, records):
     }
 
 
-def assess(github, model, pull, checkpoint=None):
+def assess(bundle, model, pull, checkpoint=None):
     if checkpoint is None:
-        github.public(pull["repo"])
-
         def checkpoint(stage, inputs, evaluate):
             return evaluate()
 
-    evidence = Evidence(github, pull)
-    paths = evidence.changed_paths()
+    evidence = PreparedEvidence(bundle)
+    paths = evidence.paths()
     classify_version = sha256((CLASSIFY + getsource(classify)).encode()).hexdigest()
     judge_version = sha256((JUDGE + getsource(judge)).encode()).hexdigest()
-    findings = checkpoint("classify", [classify_version, pull["threads"], sorted(paths)],
+    findings = checkpoint("classify", [classify_version, pull["threads"], paths],
                           lambda: classify(model, pull, paths))
     for thread, finding in zip(pull["threads"], findings):
         if finding["kind"]:
+            finding["omitted_related_paths"] = bundle["threads"][thread["id"]]["omitted_related_paths"]
             records = evidence.for_thread(thread, finding["paths"])
             inputs = [judge_version, pull["merged"], thread, finding, records]
-            finding.update(checkpoint("judge", inputs, lambda: judge(model, pull, thread, finding, records)))
+            has_snapshots = all(
+                any(key.startswith(prefix) and item["state"] != "unavailable"
+                    for key, item in records.items())
+                for prefix in ("reviewed-", "merged-")
+            )
+            if not has_snapshots or "comparison" not in records:
+                finding.update(status="unclear", outcome_reason="Prepared code evidence is incomplete.",
+                               evidence=[item["url"] for item in records.values()])
+            else:
+                finding.update(checkpoint("judge", inputs, lambda: judge(model, pull, thread, finding, records)))
         finding["thread_url"] = thread["url"]
     return findings

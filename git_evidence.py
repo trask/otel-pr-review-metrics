@@ -23,6 +23,7 @@ class GitEvidence:
         self.unavailable = set()
         self.ready = False
         self.parent = lru_cache(maxsize=64)(self._parent)
+        self.patch = lru_cache(maxsize=128)(self.patch)
 
     def git(self, *args, binary=False, lazy=True):
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0")

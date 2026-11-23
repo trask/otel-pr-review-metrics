@@ -5,6 +5,7 @@ from datetime import timedelta, timezone
 from pathlib import Path
 
 from github_data import DataError, GitHubError, endpoint, instant
+from prepared import PREPARED_VERSION, digest
 
 
 DEFAULT_ARCHIVE = Path.home() / ".otel-pr-review-metrics" / "archive.sqlite3"
@@ -58,8 +59,8 @@ class Archive:
             CREATE TABLE IF NOT EXISTS evidence (
                 request TEXT PRIMARY KEY, payload BLOB NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS evidence_ready (
-                repo TEXT, number INTEGER, version INTEGER,
+            CREATE TABLE IF NOT EXISTS prepared_evidence (
+                repo TEXT, number INTEGER, version INTEGER, input_digest TEXT, payload BLOB NOT NULL,
                 PRIMARY KEY (repo, number, version)
             );
             CREATE TABLE IF NOT EXISTS judgments (
@@ -118,22 +119,22 @@ class Archive:
                 )
         return added
 
-    def evidence_pending(self, repo, start, end):
-        for (payload,) in self.db.execute("""
-            SELECT payload FROM pulls
-            WHERE repo = ? AND merged_day BETWEEN ? AND ?
-                AND NOT EXISTS (
-                    SELECT 1 FROM evidence_ready
-                    WHERE evidence_ready.repo = pulls.repo AND evidence_ready.number = pulls.number
-                        AND version = 1
-                )
-            ORDER BY number
-        """, (repo, start.isoformat(), end.isoformat())):
-            yield decode(payload)
+    def get_prepared(self, pull):
+        exists = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prepared_evidence'"
+        ).fetchone()
+        if not exists:
+            return None
+        row = self.db.execute(
+            "SELECT input_digest, payload FROM prepared_evidence WHERE repo = ? AND number = ? AND version = ?",
+            (pull["repo"], pull["number"], PREPARED_VERSION),
+        ).fetchone()
+        return decode(row[1]) if row and row[0] == digest(pull) else None
 
-    def finish_evidence(self, repo, number):
+    def put_prepared(self, repo, number, bundle):
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO evidence_ready VALUES (?, ?, 1)", (repo, number))
+            self.db.execute("INSERT OR REPLACE INTO prepared_evidence VALUES (?, ?, ?, ?, ?)",
+                            (repo, number, bundle["version"], bundle["input"], encode(bundle)))
 
     def get_judgment(self, repo, number, stage, fingerprint):
         row = self.db.execute(

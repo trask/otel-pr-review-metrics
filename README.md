@@ -4,25 +4,24 @@ Measure inline review feedback across four public OpenTelemetry repositories. Th
 
 ## Run the scorecard
 
-Use Python 3.10 or newer, Git, and a GitHub CLI authenticated to `github.com`. Assessment also needs an authenticated GitHub Copilot CLI. Offline reporting needs only Python.
+Use Python 3.10 or newer. Capture needs Git and a GitHub CLI authenticated to `github.com`. Assessment needs an authenticated GitHub Copilot CLI. Reporting needs only Python.
 
 ```sh
-python scorecard.py capture
+python scorecard.py load-data
 python scorecard.py report
 ```
 
 `capture` archives merged PRs and their inline review data from October 1, 2026 through today in UTC. Rerun it to pick up new merges. It saves every completed PR as it goes, skips finalized days, and rechecks today and yesterday to allow for GitHub search indexing delays. It does not fetch threads again for PRs already saved. If the rate limit will reset within 60 seconds, capture waits and retries; otherwise it stops with a retry time and keeps its progress. Set `--max-rate-wait SECONDS` to change the wait, `--from` to backfill an earlier start, or `--through` to cap the backfill.
 
-The archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outside the worktree. Use `--archive PATH` to use another local file. Start from the public `data` branch to avoid downloading PRs or reusable API evidence again:
+The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outside the worktree. Use `--archive PATH` to use another local file. `load-data` downloads the public `data` branch over Git without calling the GitHub API. The branch stores a coverage file per repository and, by UTC merge month, a JSON file per merged PR plus a compressed evidence file where one has been prepared.
 
 ```sh
-python scorecard.py capture --shared
-python scorecard.py capture --publish-data
+python scorecard.py capture --with-evidence --publish-data
 ```
 
-`--shared` reads the branch without updating it. `--publish-data` loads it, captures new data, and pushes a new snapshot if there are changes. Both flags also work with `assess`. Only public PR data and supported REST fallback responses go into the snapshot. Local Git repositories and model judgments stay off the branch. If another run updates `data` before the push, rerun to load its latest snapshot.
+`--shared` loads the branch before capture without pushing. `--publish-data` loads it and pushes changes as a new commit. Local Git repositories, API response caches, and model judgments stay off the branch. If another run updates `data` before the push, rerun to load its latest snapshot.
 
-The assessor fetches the reviewed, head and merge commits into local bare Git repositories alongside the archive. It builds patches and reads file snapshots from Git first, and uses cached or live REST responses when Git cannot supply an item. `capture --with-evidence` prepares code evidence for the paths reviewers commented on. Neither capture mode makes model calls.
+`capture --with-evidence` fetches the reviewed, head and merge commits into local Git repositories. It saves patches and file snapshots for the commented path and up to three related changed paths per thread. It uses public REST evidence only when Git cannot supply it. The bundle records which evidence was unavailable or limited. Use `--max-evidence-prs 25` to prepare a batch and resume on the next run. Capture makes no model calls.
 
 `report` reads the archive offline and writes `.scorecard/scorecard.html`. Its default window is October 1 through November 15, 2026. To report on another range, use inclusive UTC merge dates:
 
@@ -38,7 +37,7 @@ python scorecard.py report --follow-up YYYY-MM-DD YYYY-MM-DD --custom-reviewer '
 
 Repeat `--custom-reviewer` for aliases. Use `--other-bot LOGIN` for unrelated automation using a GitHub User account. GitHub's Bot actor type and `[bot]` logins identify other automation automatically. Remaining User accounts count as Human. If the baseline is run without a custom login, its Automated total uses Copilot only and the Custom reviewer row is marked not measured.
 
-Run `python scorecard.py assess` to measure findings and render the report. Use `--max-prs 5` to try it on a few PRs first. Expect one model request per uncached PR with threads and one more per uncached original finding. Model requests can consume Copilot credits. `assess` accepts the same window and reviewer options as `report`. Use the same `--model` and assessment version across both windows.
+Run `python scorecard.py assess` to measure findings and render the report. Assessment reads the prepared local inputs and calls Copilot without fetching code or PR data. PRs without a prepared bundle are not measured. If a bundle exists but the required evidence is missing, the outcome is Unclear. Use `--max-prs 5` for a bounded trial. Use the same `--model` and assessment version across both windows.
 
 ## How the agent makes its calls
 

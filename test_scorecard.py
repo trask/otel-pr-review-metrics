@@ -11,6 +11,7 @@ from archive import Archive, ArchivedGitHub, encode
 from assessment import AssessmentError, Copilot, Evidence, classify, judge
 from github_data import GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
+from prepared import PREPARED_VERSION, digest, prepare
 from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render
 from shared_data import SharedData
 
@@ -43,10 +44,11 @@ def pilot_cases(root):
         thread = {"id": "thread", "url": "https://example.test/thread", "path": "adult.py",
                   "created": "2026-10-01T13:01:00Z", "opened": opened,
                   "reviewed": reviewed, "replies": [],
+                  "author": {"login": "person", "__typename": "User"},
                   "body": "This rejects 18-year-olds. The minimum age is inclusive.",
                   "hunk": "+    return age > 18"}
         pull = {"repo": REPOS[0], "number": 1, "head": head, "merge": head,
-                "merged": "2026-10-01T13:50:00Z", "threads": [thread]}
+                "merged": "2026-10-01T13:50:00Z", "threads": [thread], "missing_roots": 0}
         evidence = Evidence(Mock(), pull)
         evidence.local = GitEvidence(root, REPOS[0], 1)
         evidence.local.path = root / ".git"
@@ -92,17 +94,25 @@ class CollectionTests(unittest.TestCase):
                 self.assertIsNotNone(shared.publish())
                 shared.load()
                 self.assertIsNone(shared.publish())
-                key = f"repos/{REPOS[0]}/commits/{'a' * 40}?page=1&per_page=100"
+                pull = {"repo": REPOS[0], "number": 1, "merged": "2026-10-01T10:00:00Z",
+                        "threads": [], "missing_roots": 0}
+                bundle = {"version": PREPARED_VERSION, "input": digest(pull), "threads": {}, "records": []}
                 with writer.db:
                     writer.db.execute("INSERT INTO complete_days VALUES (?, ?)", (REPOS[0], "2026-10-01"))
-                    writer.db.execute("INSERT INTO evidence VALUES (?, ?)", (key, encode({"files": []})))
+                    writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                      (REPOS[0], 1, "2026-10-01", pull["merged"], encode(pull)))
+                writer.put_prepared(REPOS[0], 1, bundle)
                 writer.put_judgment(REPOS[0], 1, "judge", "test", {"status": "addressed"})
-                self.assertIsNotNone(shared.publish())
+                updated = shared.publish()
+                files = git_at(repo_path, "ls-tree", "-r", "--name-only", updated).splitlines()
+                self.assertIn(f"{REPOS[0]}/coverage.json", files)
+                self.assertIn(f"{REPOS[0]}/2026-10/1.json", files)
+                self.assertIn(f"{REPOS[0]}/2026-10/1.evidence.json.gz", files)
+                self.assertNotIn("archive.sqlite3", files)
             with closing(Archive(root / "reader.sqlite3")) as reader:
                 SharedData(reader, REPOS, remote=str(remote), cwd=repo_path).load()
                 self.assertEqual(reader.pending_days(REPOS[0], BASELINE[0], BASELINE[0]), [])
-                self.assertEqual(ArchivedGitHub(reader, None, REPOS[0]).get(
-                    key.split("?")[0], page=1, per_page=100), {"files": []})
+                self.assertEqual(reader.get_prepared(pull), bundle)
                 self.assertIsNone(reader.get_judgment(REPOS[0], 1, "judge", "test"))
 
     def test_capture_resumes_after_limit_and_reads_reports_from_disk(self):
@@ -221,6 +231,33 @@ class CollectionTests(unittest.TestCase):
 
 
 class AssessmentTests(unittest.TestCase):
+    def test_assess_runs_from_prepared_data_without_git_or_github(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            git = root / "git"
+            git.mkdir()
+            _, pull, _, evidence, _ = next(pilot_cases(git))
+            bundle = prepare(pull, evidence)
+            db = root / "archive.sqlite3"
+            with closing(Archive(db)) as archive:
+                with archive.db:
+                    archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                       (pull["repo"], 1, "2026-10-01", pull["merged"], encode(pull)))
+                archive.put_prepared(pull["repo"], 1, bundle)
+            model = Mock(model="test-model")
+            model.ask.side_effect = [
+                [{"id": "thread", "kind": "bug", "paths": [], "reason": "Rejects adults."}],
+                {"status": "unclear", "evidence": ["comparison"], "reason": "Timing is unclear."},
+            ]
+            with patch("scorecard.GitHub", side_effect=AssertionError("assessment must not call REST")), \
+                    patch("assessment.GitEvidence", side_effect=AssertionError("assessment must not fetch Git")), \
+                    patch("scorecard.Copilot", return_value=model):
+                self.assertEqual(main(["assess", "--archive", str(db),
+                                       "--output", str(root / "scorecard.html")]), 0)
+            self.assertEqual(model.ask.call_count, 2)
+            audit, = (root / "audit").glob("**/*.json")
+            self.assertIn('"status": "unclear"', audit.read_text(encoding="utf-8"))
+
     def test_git_evidence_separates_a_draft_cutoff_and_a_reverted_fix(self):
         with TemporaryDirectory() as work:
             for label, pull, thread, evidence, _ in pilot_cases(Path(work)):
@@ -253,12 +290,12 @@ class AssessmentTests(unittest.TestCase):
             root = Path(work)
             with closing(Archive(root / "archive.sqlite3")) as archive:
                 with patch("scorecard.assess", side_effect=run("old-prompt", judge_v1)):
-                    self.assertEqual(assess_cached(archive, None, model, pull, root, True, "old")[0],
+                    self.assertEqual(assess_cached(archive, {}, model, pull, root, True, "old")[0],
                                      ["bug", "unclear"])
                 with patch("scorecard.assess", side_effect=run("new-prompt", judge_v2)):
-                    self.assertEqual(assess_cached(archive, None, model, pull, root, True, "new")[0],
+                    self.assertEqual(assess_cached(archive, {}, model, pull, root, True, "new")[0],
                                      ["bug", "addressed"])
-                self.assertEqual(assess_cached(archive, None, model, pull, None, False, "old"),
+                self.assertEqual(assess_cached(archive, {}, model, pull, None, False, "old"),
                                  (["bug", "unclear"], False))
             classify_once.assert_called_once()
             judge_v1.assert_called_once()
@@ -275,12 +312,12 @@ class AssessmentTests(unittest.TestCase):
             {"id": "a", "kind": "test coverage gap", "paths": [], "reason": "Missing test."},
             {"id": "b", "kind": "duplicate", "original": "a", "reason": "Same missing test."},
         ]
-        rows = classify(FakeModel(answers), {"threads": threads}, set())
+        rows = classify(FakeModel(answers), {"threads": threads}, {"a": [], "b": []})
         self.assertEqual((rows[1]["kind"], rows[1]["status"], rows[1]["original_url"]),
                          (None, "duplicate", "original-url"))
         threads[1]["opened"] = threads[0]["opened"]
         with self.assertRaises(AssessmentError):
-            classify(FakeModel(answers), {"threads": threads}, set())
+            classify(FakeModel(answers), {"threads": threads}, {"a": [], "b": []})
 
     def test_addressed_needs_a_matching_later_patch_and_merge_state(self):
         records = {
