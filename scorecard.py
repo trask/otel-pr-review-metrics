@@ -349,7 +349,7 @@ def main(argv=None):
             options.add_argument("--follow-up", nargs=2, type=date.fromisoformat, metavar=("START", "END"))
             options.add_argument("--custom-reviewer", action="append", default=[], metavar="LOGIN")
             options.add_argument("--other-bot", action="append", default=[], metavar="LOGIN")
-            options.add_argument("--model", default="gpt-5.6-sol", help="GitHub Copilot CLI model ID")
+            options.add_argument("--model", default="gpt-6.2-sol", help="GitHub Copilot CLI model ID (default: %(default)s)")
             options.add_argument("--output", type=Path, default=Path(".scorecard", "scorecard.html"))
             if command == "assess":
                 options.add_argument("--audit-dir", type=Path, default=None)
