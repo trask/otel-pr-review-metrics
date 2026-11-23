@@ -9,11 +9,13 @@ from unittest.mock import Mock, patch
 
 from archive import Archive, ArchivedGitHub, encode
 from assessment import AssessmentError, Copilot, Evidence, classify, judge
-from github_data import GitHub, RateLimitError, run_command
+from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from prepared import PREPARED_VERSION, digest, prepare
-from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render
-from shared_data import SharedData
+from scorecard import (
+    ASSESSMENT_VERSION, AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render,
+)
+from shared_data import SharedData, judgment_key, public_assessment
 
 
 def git_at(path, *args, **kwargs):
@@ -114,6 +116,87 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(reader.pending_days(REPOS[0], BASELINE[0], BASELINE[0]), [])
                 self.assertEqual(reader.get_prepared(pull), bundle)
                 self.assertIsNone(reader.get_judgment(REPOS[0], 1, "judge", "test"))
+
+    def test_published_results_are_versioned_and_reusable_without_a_model(self):
+        repo = REPOS[0]
+        day = "2026-10-01"
+        link = f"https://github.com/{repo}/commit/{'c' * 40}"
+        pull = {"repo": repo, "number": 1, "merged": f"{day}T12:00:00Z", "missing_roots": 0,
+                "threads": [
+                    {"id": "first", "opened": f"{day}T09:00:00Z",
+                     "author": {"login": "copilot-pull-request-reviewer[bot]", "__typename": "Bot"}},
+                    {"id": "duplicate", "opened": f"{day}T09:30:00Z",
+                     "author": {"login": "person", "__typename": "User"}},
+                ]}
+        bundle = {"version": PREPARED_VERSION, "input": digest(pull), "records": [{"url": link}],
+                  "threads": {"first": {"records": {"merge-commit": 0}}, "duplicate": {"records": {}}}}
+        old = "a" * 64
+        model = "test-model"
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            repo_path, remote = root / "work", root / "remote.git"
+            repo_path.mkdir()
+            git_at(repo_path, "init", "--quiet")
+            git_at(repo_path, "config", "user.name", "Scorecard fixture")
+            git_at(repo_path, "config", "user.email", "fixture@example.test")
+            git_at(repo_path, "init", "--quiet", "--bare", str(remote))
+            (repo_path / "schema.json").write_text('{"format": 1}\n', encoding="utf-8")
+            git_at(repo_path, "add", "schema.json")
+            git_at(repo_path, "commit", "--quiet", "-m", "Initialize shared data")
+            git_at(repo_path, "push", "--quiet", str(remote), "HEAD:refs/heads/data")
+
+            def shared(archive, repos):
+                return SharedData(archive, repos, remote=str(remote), cwd=repo_path)
+
+            local, fresh, html = (root / name for name in ("local.sqlite3", "fresh.sqlite3", "scorecard.html"))
+            with closing(Archive(local)) as writer:
+                publisher = shared(writer, REPOS)
+                publisher.load()
+                with writer.db:
+                    writer.db.executemany("INSERT INTO complete_days VALUES (?, ?)", ((r, day) for r in REPOS))
+                    writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                      (repo, 1, day, pull["merged"], encode(pull)))
+                writer.put_prepared(repo, 1, bundle)
+                for version, status in ((old, "unaddressed"), (ASSESSMENT_VERSION, "addressed")):
+                    key = judgment_key(model, [version, pull, digest(bundle)])
+                    result = {"assessment_version": version, "model": model, "evidence_digest": digest(bundle),
+                              "threads": [
+                                  {"id": "first", "kind": "bug", "status": status, "evidence": [link],
+                                   "reason": "Do not publish this model explanation"},
+                                  {"id": "duplicate", "kind": None, "status": "duplicate", "original": "first"},
+                              ]}
+                    writer.put_judgment(repo, 1, "complete", key, result)
+                writer.put_judgment(repo, 1, "judge", "partial", {"outcome_reason": "Private intermediate output"})
+                before = publisher.publish()
+                self.assertNotIn(".assessment.", git_at(repo_path, "ls-tree", "-r", "--name-only", before))
+
+            options = ["--window", day, day, "--model", model, "--output", str(html)]
+            with (patch("scorecard.SharedData", side_effect=shared),
+                  patch.object(Copilot, "ask", side_effect=AssertionError("no model calls"))):
+                self.assertEqual(main(["assess", "--archive", str(local), "--publish-data", "--max-prs", "0",
+                                       *options]), 0)
+                self.assertEqual(main(["load-data", "--archive", str(fresh)]), 0)
+                self.assertEqual(main(["report", "--archive", str(fresh), *options]), 0)
+                self.assertIn("<td>1</td><td>1.00</td><td>1</td><td>0</td><td>0</td><td>0</td>",
+                              html.read_text(encoding="utf-8"))
+                self.assertEqual(main(["report", "--archive", str(fresh), "--assessment-version", old, *options]), 0)
+                self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>1</td><td>0</td><td>0</td>",
+                              html.read_text(encoding="utf-8"))
+
+            with closing(Archive(fresh)) as reader:
+                publisher = shared(reader, REPOS)
+                publisher.load()
+                self.assertIsNone(publisher.publish())
+                self.assertEqual(list(reader.db.execute("SELECT stage, count(*) FROM judgments GROUP BY stage")),
+                                 [("published", 2)])
+                self.assertEqual(reader.get_judgment(repo, 1, "published", key)["threads"], [
+                    {"id": "first", "kind": "bug", "status": "addressed", "evidence": [link]},
+                    {"id": "duplicate", "kind": None, "status": "duplicate", "original": "first"},
+                ])
+
+            result["threads"][0]["evidence"] = [f"https://github.com/{repo}/commit/{'d' * 40}"]
+            with self.assertRaises(DataError):
+                public_assessment(pull, result, key, bundle=bundle)
 
     def test_capture_resumes_after_limit_and_reads_reports_from_disk(self):
         repo = REPOS[0]

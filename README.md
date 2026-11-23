@@ -1,6 +1,6 @@
 # otel-pr-review-metrics
 
-Measure inline review feedback across four public OpenTelemetry repositories. The scorecard evaluates reviews already on GitHub. It does not run the custom reviewer or write to GitHub or Azure DevOps.
+Measure inline review feedback across four public OpenTelemetry repositories. The scorecard does not run the custom reviewer, write to source repositories, or update Azure DevOps. Sharing data writes only to this repository's `data` branch.
 
 ## Run the scorecard
 
@@ -19,7 +19,7 @@ The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outsi
 python scorecard.py capture --with-evidence --publish-data
 ```
 
-`--shared` loads the branch before capture without pushing. `--publish-data` loads it and pushes changes as a new commit. Local Git repositories, API response caches, and model judgments stay off the branch. If another run updates `data` before the push, rerun to load its latest snapshot.
+`--shared` loads the branch before capture without pushing. `capture --publish-data` loads it and pushes updated inputs as a new commit. It leaves existing shared assessments in place without publishing new ones. Local Git repositories and API response caches stay off the branch. If another run updates `data` before the push, rerun to load its latest snapshot.
 
 `capture --with-evidence` fetches the reviewed, head and merge commits into local Git repositories. It saves patches and file snapshots for the commented path and up to three related changed paths per thread. It uses public REST evidence only when Git cannot supply it. The bundle records which evidence was unavailable or limited. Use `--max-evidence-prs 25` to prepare a batch and resume on the next run. Capture makes no model calls.
 
@@ -38,6 +38,10 @@ python scorecard.py report --follow-up YYYY-MM-DD YYYY-MM-DD --custom-reviewer '
 Repeat `--custom-reviewer` for aliases. Use `--other-bot LOGIN` for unrelated automation using a GitHub User account. GitHub's Bot actor type and `[bot]` logins identify other automation automatically. Remaining User accounts count as Human. If the baseline is run without a custom login, its Automated total uses Copilot only and the Custom reviewer row is marked not measured.
 
 Run `python scorecard.py assess` to measure findings and render the report. Assessment reads the prepared local inputs and calls Copilot without fetching code or PR data. PRs without a prepared bundle are not measured. If a bundle exists but the required evidence is missing, the outcome is Unclear. Use `--max-prs 5` for a bounded trial. Use the same `--model` and assessment version across both windows.
+
+Use `python scorecard.py assess --publish-data` to load the shared inputs and previously published results, assess missing PRs, and publish completed decisions to `data`. The run saves locally after each PR and pushes every 25 new assessments and at the end. Add `--max-prs 0` to publish eligible cached results without calling Copilot. The shared files contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. They omit raw review text, code, model explanations, and intermediate judgments.
+
+On another machine, run `python scorecard.py load-data` and then `report --window START END` to use those results without calling Copilot. Versioned files keep earlier published results when prompts change. Use the saved `assessment_version` and model ID to report on an older version with the same inputs.
 
 ## How the agent makes its calls
 

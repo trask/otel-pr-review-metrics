@@ -16,7 +16,7 @@ from archive import DEFAULT_ARCHIVE, Archive, ArchivedGitHub
 from assessment import KINDS, OUTCOMES, Copilot, Evidence, assess
 from github_data import DataError, GitHub
 from prepared import digest, prepare
-from shared_data import SharedData
+from shared_data import SharedData, judgment_key
 
 
 REPOS = (
@@ -237,10 +237,11 @@ def assess_cached(archive, bundle, model, pull, audit, allow_model, version):
     repo, number = pull["repo"], pull["number"]
 
     def fingerprint(inputs):
-        return sha256(json.dumps([model.model, inputs], sort_keys=True).encode()).hexdigest()
+        return judgment_key(model.model, inputs)
 
     key = fingerprint([version, pull, digest(bundle)])
-    saved = archive.get_judgment(repo, number, "complete", key)
+    saved = (archive.get_judgment(repo, number, "published", key)
+             or archive.get_judgment(repo, number, "complete", key))
     if saved is None and not allow_model and version != ASSESSMENT_VERSION:
         saved = archive.get_judgment(repo, number, "complete", fingerprint([version, pull]))
     if saved is not None:
@@ -271,7 +272,7 @@ def log(message):
 
 
 def load_shared(archive, args):
-    if not (args.shared or args.publish_data):
+    if not (args.publish_data or getattr(args, "shared", False)):
         return None
     shared = SharedData(archive, REPOS)
     shared.load()
@@ -281,12 +282,13 @@ def load_shared(archive, args):
 
 def publish_shared(shared, args):
     if args.publish_data:
-        commit = shared.publish()
+        commit = shared.publish(include_assessments=args.command == "assess")
         log(f"Published shared data as {commit[:12]}" if commit else "Shared data is already up to date")
 
 
-def collect(archive, args, model, windows):
+def collect(archive, args, model, windows, shared=None):
     cohorts, failures, runs = [], 0, 0
+    completed = 0
     for label, dates in windows:
         repos = {}
         for repo in REPOS:
@@ -300,13 +302,17 @@ def collect(archive, args, model, windows):
                             archive, archive.get_prepared(pull), model, pull, args.audit_dir,
                             allow, args.assessment_version,
                         )
-                        if ran:
-                            runs += 1
                     except (DataError, OSError, TimeoutExpired, ValueError) as error:
                         log(f"{repo}#{pull['number']}: assessment failed: {error}")
                         rows = None
                         failures += 1
                         runs += 1
+                    else:
+                        if ran:
+                            runs += 1
+                            completed += 1
+                            if shared is not None and completed % 25 == 0:
+                                publish_shared(shared, args)
                 stats.collect(pull, rows, args.custom_reviewer, args.other_bot)
             log(f"{label} | {repo}: {sum(stats.threads.values())} visible threads, "
                 f"{sum(stats.pending.values())} not assessed, {stats.unknown_roots} missing roots")
@@ -330,11 +336,13 @@ def main(argv=None):
                            else "render a report offline from the archive")
         )
         options.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
+        if command in {"capture", "assess"}:
+            options.add_argument("--publish-data", action="store_true",
+                                 help=("load data and publish completed assessments" if command == "assess"
+                                       else "load and publish captured inputs on the public data branch"))
         if command == "capture":
             options.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
             options.add_argument("--shared", action="store_true", help="seed the local archive from the data branch")
-            options.add_argument("--publish-data", action="store_true",
-                                 help="load and update the public data branch; never publish judgments")
         if command != "capture":
             options.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                                  default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
@@ -422,10 +430,14 @@ def main(argv=None):
             parser.error("--follow-up requires --custom-reviewer LOGIN")
         windows.append(("Follow-up", (start, end)))
     try:
-        if not args.archive.is_file():
+        publish = args.command == "assess" and args.publish_data
+        if not args.archive.is_file() and not publish:
             raise DataError("Archive does not exist. Run `python scorecard.py load-data` or `capture` first.")
         with closing(Archive(args.archive, readonly=args.command == "report")) as archive:
-            cohorts, failures = collect(archive, args, Copilot(args.model), windows)
+            shared = load_shared(archive, args) if publish else None
+            cohorts, failures = collect(archive, args, Copilot(args.model), windows, shared)
+            if shared is not None:
+                publish_shared(shared, args)
     except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
         log(str(error))
         return 1

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from archive import decode, encode
+from assessment import KINDS, OUTCOMES
 from github_data import DataError, instant, run_command
 from git_evidence import object_id
 from prepared import PREPARED_VERSION, digest, json_bytes
@@ -24,7 +25,9 @@ ARCHIVE_NAME = "archive.sqlite3"
 MAX_LEGACY_SNAPSHOT = 95_000_000
 MANIFEST = "schema.json"
 FORMAT = {"format": 1}
-PR_FILE = re.compile(r"(\d{4}-\d{2})/([1-9]\d*)(\.json|\.evidence\.json\.gz)")
+HASH = r"[0-9a-f]{64}"
+ASSESSMENT_FILE = rf"\.assessment\.({HASH})\.json"
+PR_FILE = re.compile(rf"(\d{{4}}-\d{{2}})/([1-9]\d*)(\.json|\.evidence\.json\.gz|{ASSESSMENT_FILE})")
 MAX_RECORD_BYTES = 16_000_000
 TABLES = {
     "pulls": ("repo, number, merged_day, merged, payload", (0, 1)),
@@ -91,6 +94,61 @@ def safe_payload(payload):
         if not isinstance(content, str) or not safe(base64.b64decode(content)):
             return False
     return all(map(safe, strings(data)))
+
+
+def judgment_key(model, inputs):
+    return sha256(json.dumps([model, inputs], sort_keys=True).encode()).hexdigest()
+
+
+def public_assessment(pull, result, key, *, bundle=None):
+    def invalid():
+        raise DataError(f"Invalid shared assessment for {pull['repo']}#{pull['number']}")
+
+    version, evidence, model = (result.get(k) for k in ("assessment_version", "evidence_digest", "model"))
+    if not all(isinstance(value, str) and re.fullmatch(HASH, value) for value in (version, evidence)):
+        invalid()
+    if not isinstance(model, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}", model):
+        invalid()
+    if key != judgment_key(model, [version, pull, evidence]):
+        invalid()
+
+    threads, rows = pull["threads"], result.get("threads")
+    if not isinstance(rows, list) or not threads or len(rows) != len(threads):
+        invalid()
+    originals, decisions = {}, []
+    base = f"https://github.com/{pull['repo']}/"
+    for thread, row in zip(threads, rows):
+        if not isinstance(row, dict) or row.get("id") != thread["id"]:
+            invalid()
+        status, kind = row.get("status"), row.get("kind")
+        if not (kind in KINDS and status in OUTCOMES[:3] or kind is None and status in OUTCOMES[3:]):
+            invalid()
+        decision = {"id": thread["id"], "kind": kind, "status": status}
+        if status == "duplicate":
+            original = row.get("original")
+            if (not isinstance(original, str) or original not in originals
+                    or instant(originals[original]) >= instant(thread["opened"])):
+                invalid()
+            decision["original"] = original
+        elif kind:
+            originals[thread["id"]] = thread["opened"]
+            links = row.get("evidence")
+            if not isinstance(links, list) or any(
+                not isinstance(link, str)
+                or not link.startswith((base + "pull/", base + "blob/", base + "commit/", base + "compare/"))
+                or any(ch.isspace() for ch in link) or "?" in link
+                for link in links
+            ):
+                invalid()
+            if bundle is not None:
+                refs = bundle["threads"][thread["id"]]["records"]
+                allowed = {bundle["records"][index]["url"] for index in refs.values()}
+                if not set(links) <= allowed:
+                    invalid()
+            decision["evidence"] = links
+        decisions.append(decision)
+    return {"input_digest": key, "assessment_version": version, "evidence_digest": evidence,
+            "model": model, "threads": decisions}
 
 
 class SharedData:
@@ -165,7 +223,8 @@ class SharedData:
         else:
             if MANIFEST not in entries or any(size > MAX_RECORD_BYTES for _, size in entries.values()):
                 raise DataError("Shared data branch is missing a manifest or contains an oversized file")
-            ordered = sorted(entries, key=lambda path: (path != MANIFEST, path.endswith(".gz"), path))
+            ordered = sorted(entries, key=lambda path: (
+                path != MANIFEST, ".assessment." in path, path.endswith(".gz"), path))
             with self.archive.db:
                 for path, blob in self.blobs([(path, entries[path][0]) for path in ordered]):
                     self.load_record(path, blob)
@@ -223,7 +282,8 @@ class SharedData:
         parsed = PR_FILE.fullmatch(relative)
         if not parsed:
             raise DataError(f"Unexpected shared data file: {path}")
-        month, number, suffix = parsed.group(1), int(parsed.group(2)), parsed.group(3)
+        month, number, suffix, key = parsed.groups()
+        number = int(number)
         if suffix == ".json":
             pull = json.loads(blob)
             merged = instant(pull["merged"]).astimezone(timezone.utc).date().isoformat()
@@ -234,6 +294,14 @@ class SharedData:
             return
         row = self.archive.db.execute("SELECT merged_day, payload FROM pulls WHERE repo = ? AND number = ?",
                                      (repo, number)).fetchone()
+        if key:
+            result = json.loads(blob)
+            if (not row or not row[0].startswith(month + "-") or not isinstance(result, dict)
+                    or result != public_assessment(decode(row[1]), result, key)):
+                raise DataError(f"Invalid shared assessment: {path}")
+            self.archive.db.execute("INSERT OR REPLACE INTO judgments VALUES (?, ?, ?, ?, ?)",
+                                    (repo, number, "published", key, encode(result)))
+            return
         with gzip.GzipFile(fileobj=BytesIO(blob)) as contents:
             payload = contents.read(MAX_RECORD_BYTES + 1)
         if len(payload) > MAX_RECORD_BYTES:
@@ -246,7 +314,7 @@ class SharedData:
         self.archive.db.execute("INSERT OR REPLACE INTO prepared_evidence VALUES (?, ?, ?, ?, ?)",
                                 (repo, number, bundle["version"], bundle["input"], encode(bundle)))
 
-    def local_records(self):
+    def local_records(self, include_assessments):
         yield MANIFEST, self.text_record(FORMAT), None
         for repo in sorted(self.repositories):
             complete = self.archive.db.execute("SELECT day FROM complete_days WHERE repo = ? ORDER BY day",
@@ -265,12 +333,30 @@ class SharedData:
                 name = self.pull_file(repo, day, number)
                 yield name, self.text_record(pull), raw
                 if bundle and input_digest == digest(pull):
-                    data = json_bytes(decode(bundle))
+                    evidence = decode(bundle)
+                    data = json_bytes(evidence)
                     if len(data) > MAX_RECORD_BYTES:
                         raise DataError(f"Prepared evidence is too large for {repo}#{number}")
                     yield name.removesuffix(".json") + ".evidence.json.gz", gzip.compress(data, mtime=0), bundle
+                    if include_assessments and pull["threads"]:
+                        yield from self.assessment_records(repo, number, name, pull, evidence)
 
-    def publish(self):
+    def assessment_records(self, repo, number, name, pull, evidence):
+        evidence_digest = digest(evidence)
+        for key, payload in self.archive.db.execute("""
+            SELECT fingerprint, payload FROM judgments
+            WHERE repo = ? AND number = ? AND stage = 'complete' ORDER BY fingerprint
+        """, (repo, number)):
+            path = name.removesuffix(".json") + f".assessment.{key}.json"
+            if path in self.imported:
+                continue
+            result = decode(payload)
+            if result.get("evidence_digest") != evidence_digest:
+                continue
+            record = public_assessment(pull, result, key, bundle=evidence)
+            yield path, self.text_record(record), encode(record)
+
+    def publish(self, *, include_assessments=False):
         if self.tip is None:
             raise DataError("Load the current data branch before publishing")
         ref = f"refs/scorecard/data-{uuid4().hex}"
@@ -282,8 +368,9 @@ class SharedData:
         stream.extend(f"\nfrom {self.tip}\n".encode())
         if self.legacy:
             stream.extend(b"deleteall\n")
-        seen = {}
-        for path, blob, payload in self.local_records():
+        seen = {path: value for path, value in self.imported.items()
+                if re.search(ASSESSMENT_FILE + "$", path)}
+        for path, blob, payload in self.local_records(include_assessments):
             seen[path] = sha256(blob).digest()
             if len(blob) > MAX_RECORD_BYTES:
                 raise DataError(f"Shared record is too large: {path}")
@@ -305,6 +392,7 @@ class SharedData:
             self.git("fast-import", "--quiet", "--done", binary=True, input=bytes(stream))
             commit = self.git("rev-parse", ref)
             self.git("push", "--quiet", self.remote, f"{commit}:{DATA_REF}")
+            self.tip, self.imported, self.legacy = commit, seen, False
             return commit
         finally:
             self.git("update-ref", "-d", ref)
