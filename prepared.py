@@ -8,7 +8,7 @@ from git_evidence import GitEvidence, GitUnavailable, object_id
 
 
 PREPARED_VERSION = 1
-PATH_LIMIT = 4
+MAX_PATHS = 4
 MAX_COMMITS = 12
 UNREADABLE = (GitUnavailable, UnicodeError)
 
@@ -165,7 +165,7 @@ def evidence_paths(thread, changed):
         return (candidate.lower() not in text, not similar, -shared, candidate)
 
     related = sorted(changed - {path}, key=priority)
-    return [path, *related[:PATH_LIMIT - 1]], max(0, len(related) - PATH_LIMIT + 1)
+    return [path, *related[:MAX_PATHS - 1]], max(0, len(related) - MAX_PATHS + 1)
 
 
 def prepare(pull, evidence):

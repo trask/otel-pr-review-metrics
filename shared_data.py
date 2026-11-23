@@ -1,4 +1,3 @@
-import base64
 import gzip
 import json
 import re
@@ -33,10 +32,6 @@ PLACEHOLDER = re.compile(rb"(?i)(?:pass(?:word)?|token|secret|xxx+|\$\{?[\w.-]+\
 
 
 def safe_payload(payload):
-    data = decode(payload)
-    if data is None:
-        return False
-
     def strings(value):
         if isinstance(value, str):
             yield value.encode("utf-8")
@@ -52,11 +47,7 @@ def safe_payload(payload):
             PLACEHOLDER.fullmatch(match.group(1)) for match in URL_AUTH.finditer(text)
         )
 
-    if isinstance(data, dict) and data.get("encoding") == "base64":
-        content = data.get("content")
-        if not isinstance(content, str) or not safe(base64.b64decode(content)):
-            return False
-    return all(map(safe, strings(data)))
+    return all(map(safe, strings(decode(payload))))
 
 
 def judgment_key(model, inputs, reasoning_effort):
