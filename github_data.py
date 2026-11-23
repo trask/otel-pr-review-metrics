@@ -20,9 +20,9 @@ class RateLimitError(GitHubError):
     pass
 
 
-def run_command(args, **kwargs):
+def run_command(args, *, binary=False, **kwargs):
     return subprocess.run(
-        args, encoding="utf-8", capture_output=True, timeout=180,
+        args, encoding=None if binary else "utf-8", capture_output=True, timeout=180,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs,
     )
 

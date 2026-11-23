@@ -1,0 +1,135 @@
+import os
+import re
+import subprocess
+from functools import lru_cache
+
+from github_data import run_command
+
+
+def object_id(value):
+    return value if isinstance(value, str) and re.fullmatch("[0-9a-f]{40}", value) else None
+
+
+class GitUnavailable(RuntimeError):
+    pass
+
+
+class GitEvidence:
+    def __init__(self, root, repo, number):
+        self.path = root.joinpath(*repo.split("/")).with_suffix(".git")
+        self.url = f"https://github.com/{repo}.git"
+        self.number = number
+        self.checked = set()
+        self.unavailable = set()
+        self.ready = False
+        self.parent = lru_cache(maxsize=64)(self._parent)
+
+    def git(self, *args, binary=False, lazy=True):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if not lazy:
+            env["GIT_NO_LAZY_FETCH"] = "1"
+        command = ["git", "--no-pager", "--literal-pathspecs", "-c", "core.quotePath=false",
+                   "--git-dir", str(self.path), *args]
+        try:
+            result = run_command(command, binary=binary, env=env)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GitUnavailable(f"Git {args[0]} could not run: {error.__class__.__name__}") from error
+        if result.returncode:
+            raise GitUnavailable(f"Git {args[0]} could not read the requested evidence")
+        return result.stdout
+
+    def prepare(self, revisions):
+        needed = set(filter(object_id, revisions)) - self.checked - self.unavailable
+        if not needed:
+            return
+        if not self.ready:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not (self.path / "HEAD").exists():
+                self.git("init", "--bare", "--quiet")
+            self.git("config", "remote.origin.url", self.url)
+            self.git("config", "remote.origin.promisor", "true")
+            self.git("config", "remote.origin.partialclonefilter", "blob:none")
+            self.ready = True
+        missing = []
+        for revision in sorted(needed):
+            try:
+                self.git("rev-parse", "--verify", f"{revision}^{{commit}}", lazy=False)
+                self.checked.add(revision)
+            except GitUnavailable:
+                missing.append(revision)
+        if not missing:
+            return
+
+        def fetch(refs):
+            self.git("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--filter=blob:none",
+                     "origin", *refs)
+
+        try:
+            fetch([f"+{revision}:refs/scorecard/commits/{revision}" for revision in missing])
+        except GitUnavailable:
+            try:
+                fetch([f"+refs/pull/{self.number}/head:refs/scorecard/pulls/{self.number}"])
+            except GitUnavailable:
+                pass
+            for revision in missing:
+                try:
+                    self.git("rev-parse", "--verify", f"{revision}^{{commit}}", lazy=False)
+                except GitUnavailable:
+                    try:
+                        fetch([f"+{revision}:refs/scorecard/commits/{revision}"])
+                    except GitUnavailable:
+                        self.unavailable.add(revision)
+        self.checked.update(set(missing) - self.unavailable)
+
+    def require(self, revision):
+        self.prepare([revision])
+        if revision not in self.checked:
+            raise GitUnavailable("The archived commit is not available through Git")
+
+    def _parent(self, revision):
+        self.require(revision)
+        parents = self.git("show", "--no-patch", "--format=%P", revision).split()
+        return parents[0] if parents else None
+
+    def files(self, start, end):
+        if not start:
+            raise GitUnavailable("No first parent for the requested commit")
+        changes = self.git("diff", "--no-ext-diff", "--no-renames", "--name-status", "-z",
+                           start, end, "--").rstrip("\0").split("\0")
+        statuses = {"A": "added", "D": "removed", "M": "modified", "T": "modified"}
+        files = [{"filename": path, "status": statuses.get(kind, "modified")}
+                 for kind, path in zip(changes[::2], changes[1::2])]
+        return {"git_range": (start, end), "files": files, "files_complete": True}
+
+    def commit(self, revision):
+        return self.files(self.parent(revision), revision)
+
+    def compare(self, start, end):
+        self.require(start)
+        self.require(end)
+        base = self.git("merge-base", start, end).strip()
+        status = ("identical" if start == end else "ahead" if base == start
+                  else "behind" if base == end else "diverged")
+        item = self.files(base, end)
+        entries = self.git("log", "--reverse", "--topo-order", "--format=%H %cI", f"{start}..{end}").splitlines()
+        return dict(item, status=status, total_commits=len(entries), commits=[
+            {"sha": revision, "commit": {"committer": {"date": timestamp}}}
+            for revision, timestamp in (line.split(" ", 1) for line in entries)
+        ])
+
+    def patch(self, start, end, path):
+        return self.git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+                        start, end, "--", path)
+
+    def file(self, revision, path):
+        self.require(revision)
+        item = self.git("ls-tree", "-z", revision, "--", path)
+        if not item:
+            return None
+        metadata, _, name = item.rstrip("\0").partition("\t")
+        mode, kind, oid = metadata.split(" ")
+        if name != path or kind != "blob" or mode == "120000":
+            return b"\0"
+        if int(self.git("cat-file", "-s", oid)) > 1_000_000:
+            return b"\0"
+        return self.git("cat-file", "blob", oid, binary=True)

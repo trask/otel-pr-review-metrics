@@ -151,10 +151,11 @@ class Archive:
 class ArchivedGitHub:
     """Cache immutable revision requests for one verified public repository."""
 
-    def __init__(self, archive, github, repo):
+    def __init__(self, archive, github, repo, git_root=None):
         self.archive = archive
         self.github = github
         self.repo = repo
+        self.git_root = git_root
         self.verified = False
 
     def get(self, path, **params):

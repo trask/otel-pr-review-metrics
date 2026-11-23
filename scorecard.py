@@ -1,5 +1,6 @@
 import argparse
 import json
+import sqlite3
 import sys
 from collections import Counter
 from contextlib import closing
@@ -14,6 +15,7 @@ from subprocess import TimeoutExpired
 from archive import DEFAULT_ARCHIVE, Archive, ArchivedGitHub
 from assessment import KINDS, OUTCOMES, Copilot, Evidence, assess
 from github_data import DataError, GitHub, RateLimitError
+from shared_data import SharedData
 
 
 REPOS = (
@@ -30,7 +32,10 @@ MAIN_GROUPS = (*AUTOMATED, "human")
 UNMEASURED = "N/M"
 NO_DENOMINATOR = "N/A"
 TEMPLATE = Path(__file__).with_name("scorecard.html")
-ASSESSMENT_VERSION = sha256(Path(__file__).with_name("assessment.py").read_text(encoding="utf-8").encode()).hexdigest()
+ASSESSMENT_VERSION = sha256("".join(
+    Path(__file__).with_name(file).read_text(encoding="utf-8")
+    for file in ("assessment.py", "git_evidence.py")
+).encode()).hexdigest()
 
 
 def identity(author, custom, outside):
@@ -262,13 +267,28 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
+def load_shared(archive, args):
+    if not (args.shared or args.publish_data):
+        return None
+    shared = SharedData(archive, REPOS)
+    shared.load()
+    log(f"Loaded shared data from {shared.tip[:12]}")
+    return shared
+
+
+def publish_shared(shared, args):
+    if args.publish_data:
+        commit = shared.publish()
+        log(f"Published shared data as {commit[:12]}" if commit else "Shared data is already up to date")
+
+
 def collect(archive, github, args, model, windows):
     cohorts, failures, runs = [], 0, 0
     for label, dates in windows:
         repos = {}
         for repo in REPOS:
             stats = repos[repo] = Stats(missing=bool(archive.pending_days(repo, *dates)))
-            evidence = ArchivedGitHub(archive, github, repo)
+            evidence = ArchivedGitHub(archive, github, repo, args.archive.parent / "git")
             for pull in archive.pulls(repo, *dates):
                 rows = []
                 if pull["threads"]:
@@ -308,6 +328,9 @@ def main(argv=None):
         options.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
         if command != "report":
             options.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
+            options.add_argument("--shared", action="store_true", help="seed the local archive from the data branch")
+            options.add_argument("--publish-data", action="store_true",
+                                 help="load and update the public data branch; never publish judgments")
         if command != "capture":
             options.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                                  default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
@@ -333,6 +356,7 @@ def main(argv=None):
         github = GitHub(args.max_rate_wait)
         try:
             with closing(Archive(args.archive)) as archive:
+                shared = load_shared(archive, args)
                 for repo in REPOS:
                     log(f"Capturing {repo}")
                     added = archive.capture(github, repo, args.start, through, today)
@@ -340,14 +364,15 @@ def main(argv=None):
                 if args.with_evidence:
                     for repo in REPOS:
                         count = 0
-                        evidence = ArchivedGitHub(archive, github, repo)
+                        evidence = ArchivedGitHub(archive, github, repo, args.archive.parent / "git")
                         for pull in archive.evidence_pending(repo, args.start, through):
                             if pull["threads"]:
                                 Evidence(evidence, pull).prefetch()
                                 count += 1
                             archive.finish_evidence(repo, pull["number"])
                         log(f"{repo}: cached code evidence for {count} PRs with threads")
-        except (DataError, OSError, TimeoutExpired) as error:
+                publish_shared(shared, args)
+        except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
             log(f"Capture stopped: {error}")
             return 1
         print(args.archive)
@@ -376,11 +401,15 @@ def main(argv=None):
         windows.append(("Follow-up", (start, end)))
     github = GitHub(args.max_rate_wait) if args.command == "assess" else None
     try:
-        if not args.archive.is_file():
+        from_shared = args.command == "assess" and (args.shared or args.publish_data)
+        if not args.archive.is_file() and not from_shared:
             raise DataError("Archive does not exist. Run `python scorecard.py capture` first.")
         with closing(Archive(args.archive, readonly=args.command == "report")) as archive:
+            shared = load_shared(archive, args) if args.command == "assess" else None
             cohorts, failures = collect(archive, github, args, Copilot(args.model), windows)
-    except (DataError, OSError) as error:
+            if args.command == "assess":
+                publish_shared(shared, args)
+    except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
         log(str(error))
         return 1
     write_atomic(args.output, render(cohorts, args.custom_reviewer, args.model, args.assessment_version))

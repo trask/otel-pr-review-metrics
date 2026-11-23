@@ -1,3 +1,4 @@
+import os
 import unittest
 from contextlib import closing
 from datetime import date
@@ -6,10 +7,51 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from archive import Archive, ArchivedGitHub
-from assessment import AssessmentError, Copilot, classify, judge
-from github_data import GitHub, RateLimitError
+from archive import Archive, ArchivedGitHub, encode
+from assessment import AssessmentError, Copilot, Evidence, classify, judge
+from github_data import GitHub, RateLimitError, run_command
+from git_evidence import GitEvidence
 from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render
+from shared_data import SharedData
+
+
+def git_at(path, *args, **kwargs):
+    result = run_command(["git", "--no-pager", *args], cwd=path, **kwargs)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+    return result.stdout.strip()
+
+
+def pilot_cases(root):
+    git_at(root, "init", "--quiet")
+    git_at(root, "config", "user.name", "Scorecard fixture")
+    git_at(root, "config", "user.email", "fixture@example.test")
+
+    def commit(minute, text):
+        (root / "adult.py").write_text(f"def is_adult(age):\n    return age {text} 18\n", encoding="utf-8")
+        git_at(root, "add", "--", "adult.py")
+        time = f"2026-10-01T13:{minute:02}:00Z"
+        git_at(root, "commit", "--quiet", "-m", "Update boundary check",
+               env=dict(os.environ, GIT_AUTHOR_DATE=time, GIT_COMMITTER_DATE=time))
+        return git_at(root, "rev-parse", "HEAD")
+
+    reviewed, fixed, reverted = commit(0, ">"), commit(20, ">="), commit(40, ">")
+    for label, opened, head, expected in (
+        ("delayed draft", "2026-10-01T13:30:00Z", fixed, "unclear"),
+        ("reverted fix", "2026-10-01T13:10:00Z", reverted, "unaddressed"),
+    ):
+        thread = {"id": "thread", "url": "https://example.test/thread", "path": "adult.py",
+                  "created": "2026-10-01T13:01:00Z", "opened": opened,
+                  "reviewed": reviewed, "replies": [],
+                  "body": "This rejects 18-year-olds. The minimum age is inclusive.",
+                  "hunk": "+    return age > 18"}
+        pull = {"repo": REPOS[0], "number": 1, "head": head, "merge": head,
+                "merged": "2026-10-01T13:50:00Z", "threads": [thread]}
+        evidence = Evidence(Mock(), pull)
+        evidence.local = GitEvidence(root, REPOS[0], 1)
+        evidence.local.path = root / ".git"
+        evidence.local.ready = True
+        yield label, pull, thread, evidence, expected
 
 
 class FakeModel:
@@ -27,6 +69,42 @@ def connection(nodes, next_cursor=None):
 
 
 class CollectionTests(unittest.TestCase):
+    def test_shared_data_round_trip_uses_only_public_tables(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            repo_path, remote = root / "work", root / "remote.git"
+            repo_path.mkdir()
+            git_at(repo_path, "init", "--quiet")
+            git_at(repo_path, "config", "user.name", "Scorecard fixture")
+            git_at(repo_path, "config", "user.email", "fixture@example.test")
+            git_at(repo_path, "init", "--quiet", "--bare", str(remote))
+            source = root / "archive.sqlite3"
+            with closing(Archive(source)) as initial:
+                initial.db.execute("PRAGMA journal_mode=DELETE")
+            blob = git_at(repo_path, "hash-object", "-w", str(source))
+            tree = git_at(repo_path, "mktree", "-z", binary=True,
+                          input=f"100644 blob {blob}\tarchive.sqlite3\r\0".encode()).decode()
+            tip = git_at(repo_path, "commit-tree", tree, "-m", "Initial snapshot")
+            git_at(repo_path, "push", "--quiet", str(remote), f"{tip}:refs/heads/data")
+            with closing(Archive(root / "writer.sqlite3")) as writer:
+                shared = SharedData(writer, REPOS, remote=str(remote), cwd=repo_path)
+                shared.load()
+                self.assertIsNotNone(shared.publish())
+                shared.load()
+                self.assertIsNone(shared.publish())
+                key = f"repos/{REPOS[0]}/commits/{'a' * 40}?page=1&per_page=100"
+                with writer.db:
+                    writer.db.execute("INSERT INTO complete_days VALUES (?, ?)", (REPOS[0], "2026-10-01"))
+                    writer.db.execute("INSERT INTO evidence VALUES (?, ?)", (key, encode({"files": []})))
+                writer.put_judgment(REPOS[0], 1, "judge", "test", {"status": "addressed"})
+                self.assertIsNotNone(shared.publish())
+            with closing(Archive(root / "reader.sqlite3")) as reader:
+                SharedData(reader, REPOS, remote=str(remote), cwd=repo_path).load()
+                self.assertEqual(reader.pending_days(REPOS[0], BASELINE[0], BASELINE[0]), [])
+                self.assertEqual(ArchivedGitHub(reader, None, REPOS[0]).get(
+                    key.split("?")[0], page=1, per_page=100), {"files": []})
+                self.assertIsNone(reader.get_judgment(REPOS[0], 1, "judge", "test"))
+
     def test_capture_resumes_after_limit_and_reads_reports_from_disk(self):
         repo = REPOS[0]
         first, empty, recent = date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3)
@@ -143,6 +221,21 @@ class CollectionTests(unittest.TestCase):
 
 
 class AssessmentTests(unittest.TestCase):
+    def test_git_evidence_separates_a_draft_cutoff_and_a_reverted_fix(self):
+        with TemporaryDirectory() as work:
+            for label, pull, thread, evidence, _ in pilot_cases(Path(work)):
+                records = evidence.for_thread(thread, ["adult.py"])
+                evidence.github.get.assert_not_called()
+                self.assertIn("return age > 18", records["reviewed-0"]["text"])
+                if label == "delayed draft":
+                    self.assertEqual(records["comparison"]["commits_dated_at_or_before_publication"], 1)
+                    self.assertNotIn("later-0", records)
+                    self.assertIn("return age >= 18", records["merged-0"]["text"])
+                else:
+                    self.assertIn("later-0", records)
+                    self.assertIn("later-1", records)
+                    self.assertIn("return age > 18", records["merged-0"]["text"])
+
     def test_changing_outcome_version_keeps_classification_and_old_result(self):
         pull = {"repo": REPOS[0], "number": 1, "merge": "revision"}
         model = SimpleNamespace(model="model")
@@ -173,8 +266,10 @@ class AssessmentTests(unittest.TestCase):
 
     def test_duplicate_only_links_earlier_original_and_is_not_a_finding(self):
         threads = [
-            {"id": "a", "url": "original-url", "path": "test.py", "opened": "1", "created": "1"},
-            {"id": "b", "url": "duplicate-url", "path": "test.py", "opened": "2", "created": "2"},
+            {"id": "a", "url": "original-url", "path": "test.py",
+             "opened": "2026-10-01T00:00:00Z", "created": "2026-10-01T00:00:00Z"},
+            {"id": "b", "url": "duplicate-url", "path": "test.py",
+             "opened": "2026-10-01T01:00:00Z", "created": "2026-10-01T01:00:00Z"},
         ]
         answers = [
             {"id": "a", "kind": "test coverage gap", "paths": [], "reason": "Missing test."},
@@ -183,7 +278,7 @@ class AssessmentTests(unittest.TestCase):
         rows = classify(FakeModel(answers), {"threads": threads}, set())
         self.assertEqual((rows[1]["kind"], rows[1]["status"], rows[1]["original_url"]),
                          (None, "duplicate", "original-url"))
-        threads[1].update(opened="1", created="1")
+        threads[1]["opened"] = threads[0]["opened"]
         with self.assertRaises(AssessmentError):
             classify(FakeModel(answers), {"threads": threads}, set())
 

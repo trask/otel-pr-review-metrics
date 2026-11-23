@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import sys
 from functools import lru_cache
 from hashlib import sha256
 from inspect import getsource
@@ -9,6 +10,7 @@ from tempfile import TemporaryDirectory
 from urllib.parse import quote
 
 from github_data import DataError, GitHubError, blob_url, instant, run_command
+from git_evidence import GitEvidence, GitUnavailable, object_id
 
 
 KINDS = ("bug", "test coverage gap", "improvement")
@@ -26,7 +28,8 @@ coverage gap. A concrete change that does not address a bug or test gap is an im
 Questions without a concrete finding, praise, and unclassifiable feedback are other.
 Do not count replies as findings. If a later thread clearly flags the same concrete problem
 and needs no separate fix, label it duplicate of the earliest original thread. If the match
-isn't clear, keep both. Do not infer order for threads with tied opened and created times.
+isn't clear, keep both. Threads published at the same time have no established order,
+even if one was drafted earlier. Do not link those threads as duplicates of each other.
 For each original finding, select up to three relevant additional paths from changed_paths
 for the code comparison. Include a renamed path or a related test path when applicable.
 Return only a JSON array in thread order, one object per opener:
@@ -50,7 +53,10 @@ Choose addressed only if you can point to the reviewed state, a matching later c
 patch, and the change surviving at merge. Cite the reviewed and merged file(s), the net
 comparison where available, and the matching later commit. The later commit's committed
 date must be strictly after publication and no later than merge. A preexisting or reverted
-change is not addressed. If the timeline is ambiguous, choose unclear.
+change is not addressed. A commit's timestamp is not its push time. In particular, if the
+review was drafted earlier and a matching change could have appeared before publication,
+choose unclear unless the time it appeared is established. If a matching change in the
+merged tree can't be placed in time, choose unclear, not unaddressed.
 Choose unaddressed only after checking relevant code in the reviewed revision, the later
 comparison, and the merge and finding no matching change that survived. Cite the reviewed
 and merged file(s) and the net comparison. If required paths, history or code are missing,
@@ -100,10 +106,6 @@ class Copilot:
             raise AssessmentError("Copilot did not return valid JSON") from error
 
 
-def sha(value):
-    return value if isinstance(value, str) and re.fullmatch("[0-9a-f]{40}", value) else None
-
-
 def visible_thread(thread):
     return {key: value for key, value in thread.items() if key != "author"}
 
@@ -151,7 +153,7 @@ def classify(model, pull, changed_paths):
         if kind == "duplicate":
             original = row.get("original")
             target = originals.get(original) if isinstance(original, str) else None
-            if not target or (thread["opened"], thread["created"]) <= (target["opened"], target["created"]):
+            if not target or instant(thread["opened"]) <= instant(target["opened"]):
                 raise AssessmentError("Duplicate must reference an earlier original finding on this PR")
             item.update(status=kind, original=original, original_url=target["url"])
         elif kind == "other":
@@ -169,15 +171,24 @@ def classify(model, pull, changed_paths):
 
 
 class Evidence:
-    def __init__(self, github, pull):
+    def __init__(self, github, pull, git_root=None):
         self.github = github
         self.pull = pull
         self.repo = pull["repo"]
-        self.merge = sha(pull["merge"])
-        self.head = sha(pull["head"])
+        self.merge = object_id(pull["merge"])
+        self.head = object_id(pull["head"])
+        root = git_root or getattr(github, "git_root", None)
+        self.local = GitEvidence(root, self.repo, pull["number"]) if root else None
+        self.reported_git_failure = False
         self.commit = lru_cache(maxsize=64)(self._commit)
         self.compare = lru_cache(maxsize=24)(self._compare)
         self.file = lru_cache(maxsize=128)(self._file)
+
+    def fallback(self, error):
+        if not self.reported_git_failure:
+            print(f"{self.repo}#{self.pull['number']}: {error}; using REST for missing evidence.",
+                  file=sys.stderr, flush=True)
+            self.reported_git_failure = True
 
     def get(self, path, **params):
         try:
@@ -190,6 +201,14 @@ class Evidence:
     def _commit(self, revision):
         if not revision:
             return None
+        if self.local:
+            try:
+                return self.local.commit(revision)
+            except (GitUnavailable, UnicodeError) as error:
+                self.fallback(error)
+        return self._rest_commit(revision)
+
+    def _rest_commit(self, revision):
         item = self.get(f"commits/{revision}", per_page=100, page=1)
         if not item:
             return None
@@ -204,6 +223,14 @@ class Evidence:
         return item
 
     def _compare(self, start, end):
+        if self.local:
+            try:
+                return self.local.compare(start, end)
+            except (GitUnavailable, UnicodeError) as error:
+                self.fallback(error)
+        return self._rest_compare(start, end)
+
+    def _rest_compare(self, start, end):
         path = f"compare/{start}...{end}"
         item = self.get(path, per_page=100, page=1)
         if not item:
@@ -216,28 +243,61 @@ class Evidence:
         return item
 
     def _file(self, revision, path):
+        if self.local:
+            try:
+                content = self.local.file(revision, path)
+            except (GitUnavailable, UnicodeError) as error:
+                self.fallback(error)
+            else:
+                return self.file_state(content) if content is not None else {"state": "absent"}
         item = self.get(f"contents/{quote(path)}", ref=revision)
         if item is None:
             return {"state": "absent"}
         if not isinstance(item, dict) or item.get("encoding") != "base64":
             return {"state": "unavailable"}
         try:
-            text = base64.b64decode(item["content"]).decode("utf-8")
-        except (ValueError, UnicodeError):
+            return self.file_state(base64.b64decode(item["content"]))
+        except ValueError:
+            return {"state": "unavailable"}
+
+    @staticmethod
+    def file_state(content):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeError:
             return {"state": "unavailable"}
         if "\0" in text:
             return {"state": "unavailable"}
         return {"state": "text" if len(text) <= 14_000 else "truncated",
                 "text": bounded(text, 14_000)}
 
+    def scoped_patches(self, item, paths, rest):
+        files = item.get("files", [])
+        if "git_range" in item:
+            try:
+                return patches([
+                    dict(file, patch=self.local.patch(*item["git_range"], file["filename"]))
+                    for file in files if file["filename"] in paths
+                ], paths)
+            except (GitUnavailable, UnicodeError) as error:
+                self.fallback(error)
+                files = (rest() or {}).get("files", [])
+        return patches(files, paths)
+
     def changed_paths(self):
+        revisions = {object_id(t["reviewed"]) for t in self.pull["threads"]}
+        if self.local:
+            try:
+                self.local.prepare({*revisions, self.head, self.merge})
+            except GitUnavailable as error:
+                self.fallback(error)
         merge = self.commit(self.merge) or {}
         paths = set()
         for item in merge.get("files", []):
             paths.add(item["filename"])
             if item.get("previous_filename"):
                 paths.add(item["previous_filename"])
-        for reviewed in dict.fromkeys(sha(t["reviewed"]) for t in self.pull["threads"]):
+        for reviewed in sorted(filter(None, revisions)):
             compared = self.compare(reviewed, self.head) if reviewed and self.head else None
             for item in (compared or {}).get("files", []):
                 paths.add(item["filename"])
@@ -251,32 +311,42 @@ class Evidence:
             self.for_thread(thread, [thread["path"]])
 
     def for_thread(self, thread, paths):
-        reviewed = sha(thread["reviewed"])
+        reviewed = object_id(thread["reviewed"])
         records = {
             f"reply-{i}": {"url": reply["url"]}
             for i, reply in enumerate(thread["replies"])
         }
         compared = self.compare(reviewed, self.head) if reviewed and self.head else None
         later_shas = []
+        early_count = 0
         complete = False
         if compared:
             files = compared.get("files", [])
             complete = (
                 compared["status"] in {"ahead", "identical"}
-                and len(files) < 300 and "files" in compared
+                and (compared.get("files_complete") or (len(files) < 300 and "files" in compared))
                 and len(compared["commits"]) == compared["total_commits"]
             )
             opened, merged = instant(thread["opened"]), instant(self.pull["merged"])
             for item in compared["commits"]:
                 committed = instant(item["commit"]["committer"]["date"])
-                if opened < committed <= merged and sha(item["sha"]):
+                if opened < committed <= merged and object_id(item["sha"]):
                     later_shas.append((item["sha"], item["commit"]["committer"]["date"]))
+                elif committed <= opened:
+                    early_count += 1
                 elif committed > merged:
                     complete = False
+            scoped = self.scoped_patches(compared, paths, lambda: self._rest_compare(reviewed, self.head))
+            changed = {item["filename"] for item in files
+                       if item["filename"] in paths or item.get("previous_filename") in paths}
+            if changed - {item["path"] for item in scoped if item["patch"]}:
+                complete = False
             records["comparison"] = {
                 "url": f"https://github.com/{self.repo}/compare/{reviewed}...{self.head}",
-                "status": compared["status"], "patches": patches(files, paths),
+                "status": compared["status"],
+                "patches": scoped,
                 "files_in_comparison": len(files), "complete": complete,
+                "commits_dated_at_or_before_publication": early_count,
                 "later_commits_not_shown": max(0, len(later_shas) - MAX_COMMITS),
             }
         merge = self.commit(self.merge)
@@ -291,11 +361,11 @@ class Evidence:
         if merge:
             records["merge-commit"] = {
                 "url": f"https://github.com/{self.repo}/commit/{self.merge}",
-                "patches": patches(merge.get("files", []), paths),
+                "patches": self.scoped_patches(merge, paths, lambda: self._rest_commit(self.merge)),
             }
         for i, (revision, timestamp) in enumerate(later_shas[-MAX_COMMITS:]):
             commit = self.commit(revision)
-            relevant = patches(commit.get("files", []), paths) if commit else []
+            relevant = self.scoped_patches(commit, paths, lambda: self._rest_commit(revision)) if commit else []
             if any(item["patch"] for item in relevant):
                 records[f"later-{i}"] = {
                     "url": f"https://github.com/{self.repo}/commit/{revision}",
