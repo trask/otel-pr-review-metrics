@@ -15,8 +15,6 @@ python scorecard.py report
 
 The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outside the worktree. Use `--archive PATH` to use another local file. `load-data` downloads the public `data` branch over Git without calling the GitHub API. The branch stores a coverage file per repository and, by UTC merge month, a JSON file per merged PR plus a compressed evidence file where one has been prepared.
 
-`load-data` supports the per-PR format only. The original SQLite snapshot remains in the `data` branch history.
-
 ```sh
 python scorecard.py capture --with-evidence --publish-data
 ```
@@ -43,7 +41,7 @@ Run `python scorecard.py assess` to measure findings and render the report. Asse
 
 Use `python scorecard.py assess --publish-data` to load the shared inputs and previously published results, assess missing PRs, and publish completed decisions to `data`. The run saves locally after each PR and pushes every 25 new assessments and at the end. Add `--max-prs 0` to publish eligible cached results without calling Copilot. The shared files contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. They omit raw review text, code, model explanations, and intermediate judgments.
 
-On another machine, run `python scorecard.py load-data` and then `report --window START END` to use those results without calling Copilot. Use the saved `assessment_version`, model ID, and reasoning effort to report on an older run with the same inputs. Use `report --reasoning-effort unpinned` for older results that didn't record an effort level.
+On another machine, run `python scorecard.py load-data` and then `report --window START END` to use those results without calling Copilot. Use the saved `assessment_version`, model ID, and reasoning effort to report on an older run with the same inputs.
 
 ## How the agent makes its calls
 

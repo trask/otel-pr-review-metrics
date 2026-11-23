@@ -40,8 +40,6 @@ def decode(value):
 class Archive:
     def __init__(self, path, readonly=False):
         if readonly:
-            if not path.is_file():
-                raise DataError("Archive does not exist. Run `python scorecard.py capture` first.")
             self.db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,11 +118,6 @@ class Archive:
         return added
 
     def get_prepared(self, pull):
-        exists = self.db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prepared_evidence'"
-        ).fetchone()
-        if not exists:
-            return None
         row = self.db.execute(
             "SELECT input_digest, payload FROM prepared_evidence WHERE repo = ? AND number = ? AND version = ?",
             (pull["repo"], pull["number"], PREPARED_VERSION),

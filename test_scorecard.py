@@ -8,10 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from archive import Archive, ArchivedGitHub, encode
-from assessment import AssessmentError, Copilot, Evidence, classify, judge
+from assessment import AssessmentError, Copilot, classify, judge
 from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
-from prepared import PREPARED_VERSION, digest, prepare
+from prepared import PREPARED_VERSION, Evidence, digest, prepare
 from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -129,7 +129,6 @@ class CollectionTests(unittest.TestCase):
                 ]}
         bundle = {"version": PREPARED_VERSION, "input": digest(pull), "records": [{"url": link}],
                   "threads": {"first": {"records": {"merge-commit": 0}}, "duplicate": {"records": {}}}}
-        unpinned_version = "a" * 64
         published_version = "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313"
         model = "test-model"
         with TemporaryDirectory() as work:
@@ -148,19 +147,15 @@ class CollectionTests(unittest.TestCase):
                     writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                       (repo, 1, day, pull["merged"], encode(pull)))
                 writer.put_prepared(repo, 1, bundle)
-                for version, effort, status in (
-                    (unpinned_version, None, "unaddressed"), (published_version, "medium", "unclear"),
-                    (published_version, "high", "addressed"),
-                ):
-                    key = judgment_key(model, [version, pull, digest(bundle)], effort)
-                    result = {"assessment_version": version, "model": model, "evidence_digest": digest(bundle),
+                for effort, status in (("medium", "unclear"), ("high", "addressed")):
+                    key = judgment_key(model, [published_version, pull, digest(bundle)], effort)
+                    result = {"assessment_version": published_version, "model": model,
+                              "reasoning_effort": effort, "evidence_digest": digest(bundle),
                               "threads": [
                                   {"id": "first", "kind": "bug", "status": status, "evidence": [link],
                                    "reason": "Do not publish this model explanation"},
                                   {"id": "duplicate", "kind": None, "status": "duplicate", "original": "first"},
                               ]}
-                    if effort:
-                        result["reasoning_effort"] = effort
                     writer.put_judgment(repo, 1, "complete", key, result)
                 writer.put_judgment(repo, 1, "judge", "partial", {"outcome_reason": "Private intermediate output"})
                 before = publisher.publish()
@@ -179,17 +174,13 @@ class CollectionTests(unittest.TestCase):
                 self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>0</td><td>0</td><td>0</td>",
                               html.read_text(encoding="utf-8"))
                 self.assertIn("test-model (medium reasoning effort)", html.read_text(encoding="utf-8"))
-                self.assertEqual(main(["report", "--archive", str(fresh), "--assessment-version", unpinned_version,
-                                       "--reasoning-effort", "unpinned", *options]), 0)
-                self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>1</td><td>0</td><td>0</td>",
-                              html.read_text(encoding="utf-8"))
 
             with closing(Archive(fresh)) as reader:
                 publisher = shared(reader, REPOS)
                 publisher.load()
                 self.assertIsNone(publisher.publish())
                 self.assertEqual(list(reader.db.execute("SELECT stage, count(*) FROM judgments GROUP BY stage")),
-                                 [("published", 3)])
+                                 [("published", 2)])
                 self.assertEqual(reader.get_judgment(repo, 1, "published", key)["reasoning_effort"], "high")
                 self.assertEqual(reader.get_judgment(repo, 1, "published", key)["threads"], [
                     {"id": "first", "kind": "bug", "status": "addressed", "evidence": [link]},
@@ -335,7 +326,7 @@ class AssessmentTests(unittest.TestCase):
                 {"status": "unclear", "evidence": ["comparison"], "reason": "Timing is unclear."},
             ]
             with patch("scorecard.GitHub", side_effect=AssertionError("assessment must not call REST")), \
-                    patch("assessment.GitEvidence", side_effect=AssertionError("assessment must not fetch Git")), \
+                    patch("prepared.GitEvidence", side_effect=AssertionError("assessment must not fetch Git")), \
                     patch("scorecard.Copilot", return_value=model):
                 self.assertEqual(main(["assess", "--archive", str(db),
                                        "--output", str(root / "scorecard.html")]), 0)

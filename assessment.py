@@ -1,16 +1,11 @@
-import base64
 import json
 import os
 import re
-import sys
-from functools import lru_cache
 from hashlib import sha256
 from inspect import getsource
 from tempfile import TemporaryDirectory
-from urllib.parse import quote
 
-from github_data import DataError, GitHubError, blob_url, instant, run_command
-from git_evidence import GitEvidence, GitUnavailable, object_id
+from github_data import DataError, instant, run_command
 from prepared import PreparedEvidence
 
 
@@ -21,7 +16,6 @@ REASONING_EFFORTS = ("medium", "high")
 # Bump when the assessment rules change. Prepared evidence has its own digest.
 ASSESSMENT_VERSION = "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313"
 MAX_PATHS = 4
-MAX_COMMITS = 12
 MAX_INPUT = 180_000
 
 CLASSIFY = """
@@ -85,8 +79,6 @@ class Copilot:
         self.reasoning_effort = reasoning_effort
 
     def ask(self, instructions, data):
-        if self.reasoning_effort not in REASONING_EFFORTS:
-            raise AssessmentError("Assessment requires a pinned reasoning effort")
         prompt = instructions.strip() + "\n\nEvidence JSON:\n" + json.dumps(data, ensure_ascii=False)
         if len(prompt.encode("utf-8")) > MAX_INPUT:
             raise AssessmentError("Evidence exceeds the model input budget")
@@ -119,23 +111,6 @@ class Copilot:
 
 def visible_thread(thread):
     return {key: value for key, value in thread.items() if key != "author"}
-
-
-def bounded(text, limit):
-    if text is None or len(text) <= limit:
-        return text
-    return text[:limit] + "\n[truncated]"
-
-
-def patches(files, paths):
-    return [
-        {
-            "path": item["filename"], "previous_path": item.get("previous_filename"),
-            "status": item["status"], "patch": bounded(item.get("patch"), 10_000),
-        }
-        for item in files
-        if item["filename"] in paths or item.get("previous_filename") in paths
-    ]
 
 
 def brief(reason):
@@ -182,205 +157,6 @@ def classify(model, pull, available_paths):
     return result
 
 
-class Evidence:
-    def __init__(self, github, pull, git_root=None):
-        self.github = github
-        self.pull = pull
-        self.repo = pull["repo"]
-        self.merge = object_id(pull["merge"])
-        self.head = object_id(pull["head"])
-        root = git_root or getattr(github, "git_root", None)
-        self.local = GitEvidence(root, self.repo, pull["number"]) if root else None
-        self.reported_git_failure = False
-        self.commit = lru_cache(maxsize=64)(self._commit)
-        self.compare = lru_cache(maxsize=24)(self._compare)
-        self.file = lru_cache(maxsize=128)(self._file)
-
-    def fallback(self, error):
-        if not self.reported_git_failure:
-            print(f"{self.repo}#{self.pull['number']}: {error}; using REST for missing evidence.",
-                  file=sys.stderr, flush=True)
-            self.reported_git_failure = True
-
-    def get(self, path, **params):
-        try:
-            return self.github.get(f"repos/{self.repo}/{path}", **params)
-        except GitHubError as error:
-            if error.not_found:
-                return None
-            raise
-
-    def _commit(self, revision):
-        if not revision:
-            return None
-        if self.local:
-            try:
-                return self.local.commit(revision)
-            except (GitUnavailable, UnicodeError) as error:
-                self.fallback(error)
-        return self._rest_commit(revision)
-
-    def _rest_commit(self, revision):
-        item = self.get(f"commits/{revision}", per_page=100, page=1)
-        if not item:
-            return None
-        files = item.get("files", [])
-        for page in range(2, 31):
-            if len(files) < (page - 1) * 100:
-                break
-            extra = self.get(f"commits/{revision}", per_page=100, page=page)
-            if not extra:
-                break
-            files.extend(extra["files"])
-        return item
-
-    def _compare(self, start, end):
-        if self.local:
-            try:
-                return self.local.compare(start, end)
-            except (GitUnavailable, UnicodeError) as error:
-                self.fallback(error)
-        return self._rest_compare(start, end)
-
-    def _rest_compare(self, start, end):
-        path = f"compare/{start}...{end}"
-        item = self.get(path, per_page=100, page=1)
-        if not item:
-            return None
-        for page in range(2, (item["total_commits"] + 99) // 100 + 1):
-            extra = self.get(path, per_page=100, page=page)
-            if not extra:
-                break
-            item["commits"].extend(extra["commits"])
-        return item
-
-    def _file(self, revision, path):
-        if self.local:
-            try:
-                content = self.local.file(revision, path)
-            except (GitUnavailable, UnicodeError) as error:
-                self.fallback(error)
-            else:
-                return self.file_state(content) if content is not None else {"state": "absent"}
-        item = self.get(f"contents/{quote(path)}", ref=revision)
-        if item is None:
-            return {"state": "absent"}
-        if not isinstance(item, dict) or item.get("encoding") != "base64":
-            return {"state": "unavailable"}
-        try:
-            return self.file_state(base64.b64decode(item["content"]))
-        except ValueError:
-            return {"state": "unavailable"}
-
-    @staticmethod
-    def file_state(content):
-        try:
-            text = content.decode("utf-8")
-        except UnicodeError:
-            return {"state": "unavailable"}
-        if "\0" in text:
-            return {"state": "unavailable"}
-        return {"state": "text" if len(text) <= 14_000 else "truncated",
-                "text": bounded(text, 14_000)}
-
-    def scoped_patches(self, item, paths, rest):
-        files = item.get("files", [])
-        if "git_range" in item:
-            try:
-                return patches([
-                    dict(file, patch=self.local.patch(*item["git_range"], file["filename"]))
-                    for file in files if file["filename"] in paths
-                ], paths)
-            except (GitUnavailable, UnicodeError) as error:
-                self.fallback(error)
-                files = (rest() or {}).get("files", [])
-        return patches(files, paths)
-
-    def changed_paths(self):
-        revisions = {object_id(t["reviewed"]) for t in self.pull["threads"]}
-        if self.local:
-            try:
-                self.local.prepare({*revisions, self.head, self.merge})
-            except GitUnavailable as error:
-                self.fallback(error)
-        merge = self.commit(self.merge) or {}
-        paths = set()
-        for item in merge.get("files", []):
-            paths.add(item["filename"])
-            if item.get("previous_filename"):
-                paths.add(item["previous_filename"])
-        for reviewed in sorted(filter(None, revisions)):
-            compared = self.compare(reviewed, self.head) if reviewed and self.head else None
-            for item in (compared or {}).get("files", []):
-                paths.add(item["filename"])
-                if item.get("previous_filename"):
-                    paths.add(item["previous_filename"])
-        return paths
-
-    def for_thread(self, thread, paths):
-        reviewed = object_id(thread["reviewed"])
-        records = {
-            f"reply-{i}": {"url": reply["url"]}
-            for i, reply in enumerate(thread["replies"])
-        }
-        compared = self.compare(reviewed, self.head) if reviewed and self.head else None
-        later_shas = []
-        early_count = 0
-        complete = False
-        if compared:
-            files = compared.get("files", [])
-            complete = (
-                compared["status"] in {"ahead", "identical"}
-                and (compared.get("files_complete") or (len(files) < 300 and "files" in compared))
-                and len(compared["commits"]) == compared["total_commits"]
-            )
-            opened, merged = instant(thread["opened"]), instant(self.pull["merged"])
-            for item in compared["commits"]:
-                committed = instant(item["commit"]["committer"]["date"])
-                if opened < committed <= merged and object_id(item["sha"]):
-                    later_shas.append((item["sha"], item["commit"]["committer"]["date"]))
-                elif committed <= opened:
-                    early_count += 1
-                elif committed > merged:
-                    complete = False
-            scoped = self.scoped_patches(compared, paths, lambda: self._rest_compare(reviewed, self.head))
-            changed = {item["filename"] for item in files
-                       if item["filename"] in paths or item.get("previous_filename") in paths}
-            if changed - {item["path"] for item in scoped if item["patch"]}:
-                complete = False
-            records["comparison"] = {
-                "url": f"https://github.com/{self.repo}/compare/{reviewed}...{self.head}",
-                "status": compared["status"],
-                "patches": scoped,
-                "files_in_comparison": len(files), "complete": complete,
-                "commits_dated_at_or_before_publication": early_count,
-                "later_commits_not_shown": max(0, len(later_shas) - MAX_COMMITS),
-            }
-        merge = self.commit(self.merge)
-        for name, revision, verified in (("reviewed", reviewed, compared or self.commit(reviewed)),
-                                         ("merged", self.merge, merge)):
-            if revision and verified:
-                for i, path in enumerate(paths):
-                    records[f"{name}-{i}"] = {
-                        "url": blob_url(self.repo, revision, path), "path": path,
-                        **self.file(revision, path),
-                    }
-        if merge:
-            records["merge-commit"] = {
-                "url": f"https://github.com/{self.repo}/commit/{self.merge}",
-                "patches": self.scoped_patches(merge, paths, lambda: self._rest_commit(self.merge)),
-            }
-        for i, (revision, timestamp) in enumerate(later_shas[-MAX_COMMITS:]):
-            commit = self.commit(revision)
-            relevant = self.scoped_patches(commit, paths, lambda: self._rest_commit(revision)) if commit else []
-            if any(item["patch"] for item in relevant):
-                records[f"later-{i}"] = {
-                    "url": f"https://github.com/{self.repo}/commit/{revision}",
-                    "committed_at": timestamp, "patches": relevant,
-                }
-        return records
-
-
 def judge(model, pull, thread, finding, records):
     row = model.ask(JUDGE, {
         "thread": visible_thread(thread), "merged_at": pull["merged"],
@@ -415,11 +191,7 @@ def judge(model, pull, thread, finding, records):
     }
 
 
-def assess(bundle, model, pull, checkpoint=None):
-    if checkpoint is None:
-        def checkpoint(stage, inputs, evaluate):
-            return evaluate()
-
+def assess(bundle, model, pull, checkpoint):
     evidence = PreparedEvidence(bundle)
     paths = evidence.paths()
     classify_version = sha256((CLASSIFY + getsource(classify)).encode()).hexdigest()
