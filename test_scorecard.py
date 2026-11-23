@@ -1,18 +1,20 @@
 import os
+import sys
 import unittest
 from contextlib import closing
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from archive import Archive, encode
-from assessment import AssessmentError, Copilot, classify, judge
+from assessment import ASSESSMENT_VERSION, CLASSIFY, CLASSIFY_BATCH, DEDUPLICATE, JUDGE, classify, judge
+from copilot_model import AssessmentError, Copilot, input_size
 from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from prepared import PREPARED_VERSION, Evidence, digest, prepare
-from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render
+from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
 
@@ -128,7 +130,7 @@ class CollectionTests(unittest.TestCase):
                 ]}
         bundle = {"version": PREPARED_VERSION, "input": digest(pull), "records": [{"url": link}],
                   "threads": {"first": {"records": {"merge-commit": 0}}, "duplicate": {"records": {}}}}
-        published_version = "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313"
+        published_version = ASSESSMENT_VERSION
         model = "test-model"
         with TemporaryDirectory() as work:
             root = Path(work)
@@ -385,20 +387,75 @@ class AssessmentTests(unittest.TestCase):
     def test_duplicate_only_links_earlier_original_and_is_not_a_finding(self):
         threads = [
             {"id": "a", "url": "original-url", "path": "test.py",
-             "opened": "2026-10-01T00:00:00Z", "created": "2026-10-01T00:00:00Z"},
+             "opened": "2026-10-01T00:00:00Z", "created": "2026-10-01T00:00:00Z",
+             "body": "Add a test.", "hunk": "old hunk", "replies": ["Not sent"]},
             {"id": "b", "url": "duplicate-url", "path": "test.py",
-             "opened": "2026-10-01T01:00:00Z", "created": "2026-10-01T01:00:00Z"},
+             "opened": "2026-10-01T01:00:00Z", "created": "2026-10-01T01:00:00Z",
+             "body": "This still needs a test."},
         ]
         answers = [
             {"id": "a", "kind": "test coverage gap", "paths": [], "reason": "Missing test."},
             {"id": "b", "kind": "duplicate", "original": "a", "reason": "Same missing test."},
         ]
-        rows = classify(FakeModel(answers), {"threads": threads}, {"a": [], "b": []})
+        model = Mock()
+        model.ask.return_value = answers
+        rows = classify(model, {"threads": threads}, {"a": [], "b": []})
+        prompt, data = model.ask.call_args.args
+        self.assertEqual(prompt, CLASSIFY)
+        self.assertEqual(set(data["threads"][0]), {"id", "opened", "path", "body", "available_paths"})
         self.assertEqual((rows[1]["kind"], rows[1]["status"], rows[1]["original_url"]),
                          (None, "duplicate", "original-url"))
         threads[1]["opened"] = threads[0]["opened"]
         with self.assertRaises(AssessmentError):
             classify(FakeModel(answers), {"threads": threads}, {"a": [], "b": []})
+
+    def test_split_classification_resumes_batches_and_links_across_them(self):
+        threads = [
+            {"id": ident, "url": f"url-{ident}", "path": "test.py",
+             "opened": f"2026-10-01T0{i}:00:00Z", "body": "\u00e9" * 900}
+            for i, ident in enumerate("abc")
+        ]
+        saved, calls = {}, []
+        links = [{"id": "c", "original": "a", "reason": "Same missing test."}]
+
+        def checkpoint(stage, inputs, evaluate):
+            key = stage, digest(inputs)
+            if key not in saved:
+                saved[key] = evaluate()
+            return saved[key]
+
+        def ask(prompt, data):
+            self.assertLessEqual(input_size(prompt, data), 3500)
+            calls.append(prompt)
+            if prompt == DEDUPLICATE:
+                self.assertEqual([row["id"] for row in data["findings"]], ["a", "b", "c"])
+                return links
+            return [{"id": item["id"], "kind": "test coverage gap", "paths": [], "reason": "Missing test."}
+                    for item in data["threads"]]
+
+        model = SimpleNamespace(ask=ask)
+        pull, paths = {"threads": threads}, {ident: [] for ident in "abc"}
+        with patch("assessment.MAX_INPUT", 3500):
+            rows = classify(model, pull, paths, checkpoint)
+            self.assertEqual(calls, [CLASSIFY_BATCH, CLASSIFY_BATCH, CLASSIFY_BATCH, DEDUPLICATE])
+            self.assertEqual((rows[2]["original"], rows[2]["original_url"]), ("a", "url-a"))
+            links.append({"id": "b", "original": "c", "reason": "Invalid chain."})
+            calls.clear()
+            with self.assertRaisesRegex(AssessmentError, "earlier original"):
+                classify(model, pull, paths, checkpoint)
+            self.assertEqual(calls, [DEDUPLICATE])
+
+    def test_prioritizes_split_prs_ahead_of_earlier_repositories(self):
+        pulls = {REPOS[0]: [{"repo": REPOS[0], "number": 1, "threads": []}],
+                 REPOS[-1]: [{"repo": REPOS[-1], "number": 2, "threads": [
+                     {"id": "t", "body": "x" * 180_000, "path": "a", "opened": "time"},
+                 ]}]}
+        bundle = {"threads": {"t": {"paths": ["a"]}}}
+        archive = Mock()
+        archive.pulls.side_effect = lambda repo, *_: iter(pulls.get(repo, []))
+        archive.get_prepared.return_value = bundle
+        self.assertEqual([(pull["number"], evidence) for pull, evidence in assessment_order(archive, BASELINE, True)],
+                         [(2, bundle), (1, None)])
 
     def test_addressed_needs_a_matching_later_patch_and_merge_state(self):
         records = {
@@ -414,18 +471,55 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual(judge(FakeModel(reply), *args)["evidence"],
                          ["reviewed-url", "merged-url", "later-url"])
 
-    def test_json_events_preserve_long_model_answers_and_disable_tools(self):
-        stdout = ('{"type":"session.info","data":{}}\n'
-                  '{"type":"assistant.message","data":{"content":"{\\"ok\\":true}"}}\n')
-        with patch("github_data.subprocess.run", return_value=SimpleNamespace(
-            returncode=0, stdout=stdout,
-        )) as run:
-            for model, effort in ((Copilot("model"), "high"), (Copilot("model", "medium"), "medium")):
-                self.assertEqual(model.ask("Classify", {}), {"ok": True})
-                args = run.call_args.args[0]
-                self.assertEqual(args[args.index("--reasoning-effort") + 1], effort)
-                self.assertIn("--available-tools=scorecard_no_tools", args)
-                self.assertIn("creationflags", run.call_args.kwargs)
+    @unittest.skipIf(sys.version_info < (3, 11), "SDK requires Python 3.11")
+    def test_sdk_reuses_client_but_replaces_prompt_in_each_tool_free_session(self):
+        response = SimpleNamespace(data=SimpleNamespace(content='```json\n{"ok":true}\n```'))
+        sessions = [AsyncMock(), AsyncMock()]
+        for session in sessions:
+            session.send_and_wait.return_value = response
+        client = Mock(create_session=AsyncMock(side_effect=sessions), stop=AsyncMock())
+        sdk = SimpleNamespace(CopilotClient=Mock(return_value=client), JsonRpcError=RuntimeError)
+        with patch.dict("sys.modules", {"copilot": sdk}), patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "test"}):
+            with closing(Copilot("model", "medium")) as model:
+                self.assertEqual(model.ask(CLASSIFY, {}), {"ok": True})
+                self.assertEqual(model.ask(JUDGE, {}), {"ok": True})
+        sdk.CopilotClient.assert_called_once()
+        self.assertEqual(sdk.CopilotClient.call_args.kwargs["mode"], "empty")
+        for call, session, prompt in zip(client.create_session.await_args_list, sessions, (CLASSIFY, JUDGE), strict=True):
+            self.assertEqual(call.kwargs, {"model": "model", "reasoning_effort": "medium", "available_tools": [],
+                                           "system_message": {"mode": "replace", "content": prompt.strip()}})
+            session.send_and_wait.assert_awaited_once()
+            session.disconnect.assert_awaited_once()
+        client.stop.assert_awaited_once()
+
+    def test_judge_preserves_core_evidence_when_dropping_optional_context(self):
+        records = {
+            "reviewed-0": {"url": "reviewed", "state": "text", "path": "a"},
+            "merged-0": {"url": "merged", "state": "text", "path": "a"},
+            "comparison": {"url": "comparison", "complete": True},
+            "later-0": {"url": "later"},
+            "merge-commit": {"url": "merge-commit", "text": "x" * 180_000},
+            "reply-0": {"url": "reply"},
+        }
+        model = Mock()
+        model.ask.return_value = {"status": "addressed", "reason": "The fix survived.",
+                                  "evidence": ["reviewed-0", "merged-0", "later-0"]}
+        thread = {"hunk": "hunk", "replies": [{"body": "reply"}]}
+        args = (model, {"merged": "time"}, thread, {"paths": ["a"]}, records)
+        self.assertEqual(judge(*args)["status"], "addressed")
+        self.assertEqual(set(model.ask.call_args.args[1]["evidence"]),
+                         {"reviewed-0", "merged-0", "comparison", "later-0"})
+        model.ask.reset_mock()
+        records["later-1"] = {"url": "oversized later", "text": "x" * 180_000}
+        self.assertEqual(judge(*args)["status"], "addressed")
+        sent = model.ask.call_args.args[1]["evidence"]
+        self.assertNotIn("later-1", sent)
+        self.assertEqual(sent["comparison"]["later_commits_not_shown"], 1)
+        self.assertNotIn("later_commits_not_shown", records["comparison"])
+        model.ask.reset_mock()
+        records["reviewed-0"]["text"] = "x" * 180_000
+        self.assertEqual(judge(*args)["status"], "unclear")
+        model.ask.assert_not_called()
 
     def test_missing_comparison_cannot_establish_an_unaddressed_finding(self):
         records = {

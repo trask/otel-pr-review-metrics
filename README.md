@@ -4,7 +4,7 @@ Measure inline review feedback across four public OpenTelemetry repositories. Th
 
 ## Run the scorecard
 
-Use Python 3.10 or newer. Capture needs Git and a GitHub CLI authenticated to `github.com`. Assessment needs an authenticated GitHub Copilot CLI. Reporting needs only Python.
+Use Python 3.10 or newer. Capture needs Git and a GitHub CLI authenticated to `github.com`. Reporting needs only Python.
 
 ```sh
 python scorecard.py load-data
@@ -37,7 +37,20 @@ python scorecard.py report --follow-up YYYY-MM-DD YYYY-MM-DD --custom-reviewer '
 
 Repeat `--custom-reviewer` for aliases. Use `--other-bot LOGIN` for unrelated automation using a GitHub User account. GitHub's Bot actor type and `[bot]` logins identify other automation automatically. Remaining User accounts count as Human. If the baseline is run without a custom login, its Automated total uses Copilot only and the Custom reviewer row is marked not measured.
 
-Run `python scorecard.py assess` to measure findings and render the report. Assessment reads the prepared local inputs and calls Copilot without fetching code or PR data. It defaults to GPT-6.2 Sol (`gpt-6.2-sol`) with `high` reasoning effort. Use `--reasoning-effort medium` for a separate run at medium effort. PRs without a prepared bundle are not measured. If a bundle exists but the required evidence is missing, the outcome is Unclear. Use `--max-prs 5` for a bounded trial. Use the same model, effort, and assessment version across both windows.
+Assessment needs Python 3.11 or newer and the Copilot SDK. Install it and download its runtime:
+
+```sh
+python -m pip install -r requirements.txt
+python -m copilot download-runtime
+```
+
+Set `COPILOT_GITHUB_TOKEN` to a token with Copilot access. The runner also accepts `GH_TOKEN` or `GITHUB_TOKEN` if `COPILOT_GITHUB_TOKEN` is unset. Run `python scorecard.py assess` to measure findings and render the report. Assessment reads the prepared local inputs and calls Copilot without fetching code or PR data. It defaults to GPT-6.2 Sol (`gpt-6.2-sol`) with `high` reasoning effort. Use `--reasoning-effort medium` for a separate run at medium effort. PRs without a prepared bundle are not measured. If the required evidence is missing or exceeds the input budget, the outcome is Unclear. Use the same model, effort, and assessment version across both windows.
+
+To pilot large PRs before the full run, put PRs that require more than one classification request first:
+
+```sh
+python scorecard.py assess --window 2026-10-01 2026-11-21 --max-prs 25 --prioritize-oversized
+```
 
 Use `python scorecard.py assess --publish-data` to load the shared inputs and previously published results, assess missing PRs, and publish completed decisions to `data`. The run saves locally after each PR and pushes every 25 new assessments and at the end. Add `--max-prs 0` to publish eligible cached results without calling Copilot. The shared files contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. They omit raw review text, code, model explanations, and intermediate judgments.
 
@@ -45,7 +58,7 @@ On another machine, run `python scorecard.py load-data` and then `report --windo
 
 ## How the agent makes its calls
 
-The first model pass reads the inline thread openers on a PR, classifies what they flag, links clear duplicates to their originals, and selects relevant files. The second pass examines each original finding using public GitHub patches and file snapshots from the reviewed revision, later commits and the merged revision. The program checks that evidence links come from those inputs. The model has no tools; the collector alone makes read-only GitHub requests. Only public evidence goes to Copilot.
+The classifier sends only the inline thread openers and the IDs, times, and paths it needs. It classifies them, links clear duplicates to their originals, and selects relevant files. If a PR exceeds the input budget, it classifies the openers in batches, then checks the finding summaries for duplicates across the whole PR. The outcome pass examines each original finding separately using public GitHub patches and file snapshots from the reviewed revision, later commits and the merged revision. The program checks that evidence links come from those inputs. One Copilot SDK client handles the run, with a fresh session per request, a task-specific system prompt that replaces the default agent prompt, and no tools. Only public evidence goes to Copilot.
 
 A thread opens when GitHub publishes it, not when it was drafted. A commit timestamp is not proof of when a change was pushed or why it was made. The agent uses Unclear if a matching change cannot be placed before or after publication, or if the evidence is otherwise insufficient. The scorecard marks missing assessments as N/M. GitHub does not expose deleted comments, so the report can only measure threads whose openers remain observable.
 

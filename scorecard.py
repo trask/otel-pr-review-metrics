@@ -12,9 +12,10 @@ from string import Template
 from subprocess import TimeoutExpired
 
 from archive import DEFAULT_ARCHIVE, Archive
-from assessment import ASSESSMENT_VERSION, DEFAULT_REASONING_EFFORT, KINDS, OUTCOMES, REASONING_EFFORTS, Copilot, assess
+from assessment import ASSESSMENT_VERSION, KINDS, OUTCOMES, REASONING_EFFORTS, assess, needs_classification_batches
+from copilot_model import DEFAULT_REASONING_EFFORT, AssessmentSetupError, Copilot
 from github_data import DataError, GitHub
-from prepared import Evidence, digest, prepare
+from prepared import Evidence, PreparedEvidence, digest, prepare
 from shared_data import SharedData, judgment_key
 
 
@@ -278,34 +279,53 @@ def publish_shared(shared, *, include_assessments=False):
     log(f"Published shared data as {commit[:12]}" if commit else "Shared data is already up to date")
 
 
+def assessment_order(archive, dates, prioritize_oversized):
+    remaining = []
+    for repo in REPOS:
+        for pull in archive.pulls(repo, *dates):
+            if not prioritize_oversized:
+                yield pull, None
+                continue
+            bundle = archive.get_prepared(pull) if pull["threads"] else None
+            if bundle is not None and needs_classification_batches(pull, PreparedEvidence(bundle).paths()):
+                log(f"Prioritizing split classification for {repo}#{pull['number']}")
+                yield pull, bundle
+            else:
+                remaining.append(pull)
+    for pull in remaining:
+        yield pull, None
+
+
 def collect(archive, args, model, windows, shared=None):
     cohorts, failures, runs = [], 0, 0
     completed = 0
     for label, dates in windows:
-        repos = {}
-        for repo in REPOS:
-            stats = repos[repo] = Stats(missing=bool(archive.pending_days(repo, *dates)))
-            for pull in archive.pulls(repo, *dates):
-                rows = []
-                if pull["threads"]:
-                    allow = args.command == "assess" and (args.max_prs is None or runs < args.max_prs)
-                    try:
-                        rows, ran = assess_cached(
-                            archive, archive.get_prepared(pull), model, pull, args.audit_dir,
-                            allow, args.assessment_version,
-                        )
-                    except (DataError, OSError, TimeoutExpired, ValueError) as error:
-                        log(f"{repo}#{pull['number']}: assessment failed: {error}")
-                        rows = None
-                        failures += 1
+        repos = {repo: Stats(missing=bool(archive.pending_days(repo, *dates))) for repo in REPOS}
+        for pull, bundle in assessment_order(archive, dates, args.prioritize_oversized):
+            repo = pull["repo"]
+            rows = []
+            if pull["threads"]:
+                allow = args.command == "assess" and (args.max_prs is None or runs < args.max_prs)
+                try:
+                    rows, ran = assess_cached(
+                        archive, bundle if bundle is not None else archive.get_prepared(pull),
+                        model, pull, args.audit_dir, allow, args.assessment_version,
+                    )
+                except AssessmentSetupError:
+                    raise
+                except (DataError, OSError, TimeoutExpired, ValueError) as error:
+                    log(f"{repo}#{pull['number']}: assessment failed: {error}")
+                    rows = None
+                    failures += 1
+                    runs += 1
+                else:
+                    if ran:
                         runs += 1
-                    else:
-                        if ran:
-                            runs += 1
-                            completed += 1
-                            if shared is not None and completed % 25 == 0:
-                                publish_shared(shared, include_assessments=True)
-                stats.collect(pull, rows, args.custom_reviewer, args.other_bot)
+                        completed += 1
+                        if shared is not None and completed % 25 == 0:
+                            publish_shared(shared, include_assessments=True)
+            repos[repo].collect(pull, rows, args.custom_reviewer, args.other_bot)
+        for repo, stats in repos.items():
             log(f"{label} | {repo}: {sum(stats.threads.values())} visible threads, "
                 f"{sum(stats.pending.values())} not assessed, {stats.unknown_roots} missing roots")
         cohorts.append(Cohort(label, dates, repos))
@@ -389,9 +409,9 @@ def build_report(args, parser):
         publish = assessing and args.publish_data
         if not args.archive.is_file() and not publish:
             raise DataError("Archive does not exist. Run `python scorecard.py load-data` or `capture` first.")
-        with closing(Archive(args.archive, readonly=not assessing)) as archive:
+        with closing(Archive(args.archive, readonly=not assessing)) as archive, \
+                closing(Copilot(args.model, args.reasoning_effort)) as model:
             shared = load_shared(archive) if publish else None
-            model = Copilot(args.model, args.reasoning_effort)
             cohorts, failures = collect(archive, args, model, windows, shared)
             if shared is not None:
                 publish_shared(shared, include_assessments=True)
@@ -425,7 +445,8 @@ def main(argv=None):
     capture.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
 
     for command in (assessment, report):
-        command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None)
+        command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None,
+                             prioritize_oversized=False)
         command.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                              default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
         command.add_argument("--follow-up", nargs=2, type=date.fromisoformat, metavar=("START", "END"))
@@ -438,6 +459,8 @@ def main(argv=None):
     assessment.add_argument("--publish-data", action="store_true", help="load data and publish completed assessments")
     assessment.add_argument("--audit-dir", type=Path)
     assessment.add_argument("--max-prs", type=int, help="limit new assessments to this many PRs")
+    assessment.add_argument("--prioritize-oversized", action="store_true",
+                            help="assess PRs that need classification batches first in each window")
     report.add_argument("--assessment-version", help="full assessment_version from a saved audit file")
 
     args = parser.parse_args(argv)
