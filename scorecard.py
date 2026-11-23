@@ -6,14 +6,15 @@ from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from hashlib import sha256
 from html import escape
 from pathlib import Path
 from string import Template
 from subprocess import TimeoutExpired
 
 from archive import DEFAULT_ARCHIVE, Archive, ArchivedGitHub
-from assessment import DEFAULT_REASONING_EFFORT, KINDS, OUTCOMES, REASONING_EFFORTS, Copilot, Evidence, assess
+from assessment import (
+    ASSESSMENT_VERSION, DEFAULT_REASONING_EFFORT, KINDS, OUTCOMES, REASONING_EFFORTS, Copilot, Evidence, assess,
+)
 from github_data import DataError, GitHub
 from prepared import digest, prepare
 from shared_data import SharedData, judgment_key
@@ -33,10 +34,7 @@ MAIN_GROUPS = (*AUTOMATED, "human")
 UNMEASURED = "N/M"
 NO_DENOMINATOR = "N/A"
 TEMPLATE = Path(__file__).with_name("scorecard.html")
-ASSESSMENT_VERSION = sha256("".join(
-    Path(__file__).with_name(file).read_text(encoding="utf-8")
-    for file in ("assessment.py", "prepared.py")
-).encode()).hexdigest()
+COMMAND_ERRORS = (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError)
 
 
 def identity(author, custom, outside):
@@ -273,19 +271,16 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def load_shared(archive, args):
-    if not (args.publish_data or getattr(args, "shared", False)):
-        return None
+def load_shared(archive):
     shared = SharedData(archive, REPOS)
     shared.load()
     log(f"Loaded shared data from {shared.tip[:12]}")
     return shared
 
 
-def publish_shared(shared, args):
-    if args.publish_data:
-        commit = shared.publish(include_assessments=args.command == "assess")
-        log(f"Published shared data as {commit[:12]}" if commit else "Shared data is already up to date")
+def publish_shared(shared, *, include_assessments=False):
+    commit = shared.publish(include_assessments=include_assessments)
+    log(f"Published shared data as {commit[:12]}" if commit else "Shared data is already up to date")
 
 
 def collect(archive, args, model, windows, shared=None):
@@ -314,7 +309,7 @@ def collect(archive, args, model, windows, shared=None):
                             runs += 1
                             completed += 1
                             if shared is not None and completed % 25 == 0:
-                                publish_shared(shared, args)
+                                publish_shared(shared, include_assessments=True)
                 stats.collect(pull, rows, args.custom_reviewer, args.other_bot)
             log(f"{label} | {repo}: {sum(stats.threads.values())} visible threads, "
                 f"{sum(stats.pending.values())} not assessed, {stats.unknown_roots} missing roots")
@@ -322,106 +317,67 @@ def collect(archive, args, model, windows, shared=None):
     return cohorts, failures
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Build an aggregate scorecard from public GitHub PRs.")
-    sub = parser.add_subparsers(dest="command", required=True)
-    capture = sub.add_parser("capture", help="update the local archive without using a model")
-    load = sub.add_parser("load-data", help="download the shared data branch without calling the GitHub API")
-    load.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
-    capture.add_argument("--from", dest="start", type=date.fromisoformat, default=BASELINE[0])
-    capture.add_argument("--through", type=date.fromisoformat, help="last UTC day to capture (default: today)")
-    capture.add_argument("--with-evidence", action="store_true", help="prepare PR evidence for offline assessment")
-    capture.add_argument("--max-evidence-prs", type=int, help="cap new PR evidence bundles in this capture")
-    for command in ("capture", "assess", "report"):
-        options = capture if command == "capture" else sub.add_parser(
-            command, help=("assess archived threads and render a report" if command == "assess"
-                           else "render a report offline from the archive")
-        )
-        options.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
-        if command in {"capture", "assess"}:
-            options.add_argument("--publish-data", action="store_true",
-                                 help=("load data and publish completed assessments" if command == "assess"
-                                       else "load and publish captured inputs on the public data branch"))
-        if command == "capture":
-            options.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
-            options.add_argument("--shared", action="store_true", help="seed the local archive from the data branch")
-        if command != "capture":
-            options.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
-                                 default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
-            options.add_argument("--follow-up", nargs=2, type=date.fromisoformat, metavar=("START", "END"))
-            options.add_argument("--custom-reviewer", action="append", default=[], metavar="LOGIN")
-            options.add_argument("--other-bot", action="append", default=[], metavar="LOGIN")
-            options.add_argument("--model", default="gpt-6.2-sol", help="GitHub Copilot CLI model ID (default: %(default)s)")
-            efforts = (*REASONING_EFFORTS, "unpinned") if command == "report" else REASONING_EFFORTS
-            options.add_argument("--reasoning-effort", choices=efforts, default=DEFAULT_REASONING_EFFORT,
-                                 help="reasoning effort for the assessment (default: %(default)s)")
-            options.add_argument("--output", type=Path, default=Path(".scorecard", "scorecard.html"))
-            if command == "assess":
-                options.add_argument("--audit-dir", type=Path, default=None)
-                options.add_argument("--max-prs", type=int, help="limit new assessments to this many PRs")
-            else:
-                options.add_argument("--assessment-version", default=ASSESSMENT_VERSION,
-                                     help="full assessment_version from a saved audit file")
-    args = parser.parse_args(argv)
+def load_data(args, _parser):
+    try:
+        with closing(Archive(args.archive)) as archive:
+            load_shared(archive)
+    except COMMAND_ERRORS as error:
+        log(f"Load stopped: {error}")
+        return 1
+    return 0
+
+
+def capture_data(args, parser):
     today = datetime.now(timezone.utc).date()
-    if args.command == "load-data":
-        try:
-            with closing(Archive(args.archive)) as archive:
-                shared = SharedData(archive, REPOS)
-                shared.load()
-                log(f"Loaded shared data from {shared.tip[:12]}")
-        except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
-            log(f"Load stopped: {error}")
-            return 1
-        return 0
-    if getattr(args, "max_rate_wait", 0) < 0:
+    if args.max_rate_wait < 0:
         parser.error("--max-rate-wait cannot be negative")
-    if args.command == "capture":
-        if args.max_evidence_prs is not None and (not args.with_evidence or args.max_evidence_prs < 1):
-            parser.error("--max-evidence-prs requires --with-evidence and a positive limit")
-        through = args.through or today
-        if not args.start <= through <= today:
-            parser.error("capture dates must be in order and no later than today UTC")
-        github = GitHub(args.max_rate_wait)
-        try:
-            with closing(Archive(args.archive)) as archive:
-                shared = load_shared(archive, args)
+    if args.max_evidence_prs is not None and (not args.with_evidence or args.max_evidence_prs < 1):
+        parser.error("--max-evidence-prs requires --with-evidence and a positive limit")
+    through = args.through or today
+    if not args.start <= through <= today:
+        parser.error("capture dates must be in order and no later than today UTC")
+    github = GitHub(args.max_rate_wait)
+    try:
+        with closing(Archive(args.archive)) as archive:
+            shared = load_shared(archive) if args.shared or args.publish_data else None
+            for repo in REPOS:
+                log(f"Capturing {repo}")
+                added = archive.capture(github, repo, args.start, through, today)
+                log(f"{repo}: {added} new PRs archived")
+            if args.with_evidence:
+                total_prepared = 0
                 for repo in REPOS:
-                    log(f"Capturing {repo}")
-                    added = archive.capture(github, repo, args.start, through, today)
-                    log(f"{repo}: {added} new PRs archived")
-                if args.with_evidence:
-                    total_prepared = 0
-                    for repo in REPOS:
-                        count = 0
-                        evidence = ArchivedGitHub(archive, github, repo, args.archive.parent / "git")
-                        for pull in archive.pulls(repo, args.start, through):
-                            if not pull["threads"] or archive.get_prepared(pull) is not None:
-                                continue
-                            if args.max_evidence_prs is not None and total_prepared >= args.max_evidence_prs:
-                                break
-                            bundle = prepare(pull, Evidence(evidence, pull))
-                            archive.put_prepared(repo, pull["number"], bundle)
-                            count += 1
-                            total_prepared += 1
-                            log(f"Prepared {repo}#{pull['number']}")
-                        log(f"{repo}: {count} new evidence bundles")
-                publish_shared(shared, args)
-        except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
-            log(f"Capture stopped: {error}")
-            return 1
-        print(args.archive)
-        return 0
+                    count = 0
+                    evidence = ArchivedGitHub(archive, github, repo, args.archive.parent / "git")
+                    for pull in archive.pulls(repo, args.start, through):
+                        if not pull["threads"] or archive.get_prepared(pull) is not None:
+                            continue
+                        if args.max_evidence_prs is not None and total_prepared >= args.max_evidence_prs:
+                            break
+                        bundle = prepare(pull, Evidence(evidence, pull))
+                        archive.put_prepared(repo, pull["number"], bundle)
+                        count += 1
+                        total_prepared += 1
+                        log(f"Prepared {repo}#{pull['number']}")
+                    log(f"{repo}: {count} new evidence bundles")
+            if args.publish_data:
+                publish_shared(shared)
+    except COMMAND_ERRORS as error:
+        log(f"Capture stopped: {error}")
+        return 1
+    print(args.archive)
+    return 0
+
+
+def build_report(args, parser):
+    assessing = args.command == "assess"
     args.custom_reviewer = {login.lower() for login in args.custom_reviewer}
     args.other_bot = {login.lower() for login in args.other_bot}
-    if args.command == "assess":
+    if assessing:
         args.audit_dir = args.audit_dir or args.archive.parent / "audit"
-        args.assessment_version = ASSESSMENT_VERSION
-    else:
-        args.audit_dir = None
     if args.custom_reviewer & (args.other_bot | COPILOT):
         parser.error("a custom reviewer login cannot also be another bot or GitHub Copilot")
-    if args.command == "assess" and args.max_prs is not None and args.max_prs < 0:
+    if assessing and args.max_prs is not None and args.max_prs < 0:
         parser.error("--max-prs cannot be negative")
     dates = tuple(args.window)
     if dates[0] > dates[1]:
@@ -435,21 +391,62 @@ def main(argv=None):
             parser.error("--follow-up requires --custom-reviewer LOGIN")
         windows.append(("Follow-up", (start, end)))
     try:
-        publish = args.command == "assess" and args.publish_data
+        publish = assessing and args.publish_data
         effort = None if args.reasoning_effort == "unpinned" else args.reasoning_effort
         if not args.archive.is_file() and not publish:
             raise DataError("Archive does not exist. Run `python scorecard.py load-data` or `capture` first.")
-        with closing(Archive(args.archive, readonly=args.command == "report")) as archive:
-            shared = load_shared(archive, args) if publish else None
+        with closing(Archive(args.archive, readonly=not assessing)) as archive:
+            shared = load_shared(archive) if publish else None
             cohorts, failures = collect(archive, args, Copilot(args.model, effort), windows, shared)
             if shared is not None:
-                publish_shared(shared, args)
-    except (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError) as error:
+                publish_shared(shared, include_assessments=True)
+    except COMMAND_ERRORS as error:
         log(str(error))
         return 1
     write_atomic(args.output, render(cohorts, args.custom_reviewer, args.model, args.assessment_version, effort))
     print(args.output)
     return int(bool(failures))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Build an aggregate scorecard from public GitHub PRs.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    capture = sub.add_parser("capture", help="update the local archive without using a model")
+    load = sub.add_parser("load-data", help="download the shared data branch without calling the GitHub API")
+    assessment = sub.add_parser("assess", help="assess archived threads and render a report")
+    report = sub.add_parser("report", help="render a report offline from the archive")
+    for command in (capture, load, assessment, report):
+        command.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
+
+    load.set_defaults(run=load_data)
+    capture.set_defaults(run=capture_data)
+    capture.add_argument("--from", dest="start", type=date.fromisoformat, default=BASELINE[0])
+    capture.add_argument("--through", type=date.fromisoformat, help="last UTC day to capture (default: today)")
+    capture.add_argument("--with-evidence", action="store_true", help="prepare PR evidence for offline assessment")
+    capture.add_argument("--max-evidence-prs", type=int, help="cap new PR evidence bundles in this capture")
+    capture.add_argument("--publish-data", action="store_true",
+                         help="load and publish captured inputs on the public data branch")
+    capture.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
+    capture.add_argument("--shared", action="store_true", help="seed the local archive from the data branch")
+
+    for command, efforts in ((assessment, REASONING_EFFORTS), (report, (*REASONING_EFFORTS, "unpinned"))):
+        command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None)
+        command.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
+                             default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
+        command.add_argument("--follow-up", nargs=2, type=date.fromisoformat, metavar=("START", "END"))
+        command.add_argument("--custom-reviewer", action="append", default=[], metavar="LOGIN")
+        command.add_argument("--other-bot", action="append", default=[], metavar="LOGIN")
+        command.add_argument("--model", default="gpt-6.2-sol", help="GitHub Copilot CLI model ID (default: %(default)s)")
+        command.add_argument("--reasoning-effort", choices=efforts, default=DEFAULT_REASONING_EFFORT,
+                             help="reasoning effort for the assessment (default: %(default)s)")
+        command.add_argument("--output", type=Path, default=Path(".scorecard", "scorecard.html"))
+    assessment.add_argument("--publish-data", action="store_true", help="load data and publish completed assessments")
+    assessment.add_argument("--audit-dir", type=Path)
+    assessment.add_argument("--max-prs", type=int, help="limit new assessments to this many PRs")
+    report.add_argument("--assessment-version", help="full assessment_version from a saved audit file")
+
+    args = parser.parse_args(argv)
+    return args.run(args, parser)
 
 
 if __name__ == "__main__":

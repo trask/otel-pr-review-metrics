@@ -2,14 +2,9 @@ import base64
 import gzip
 import json
 import re
-import sqlite3
-from contextlib import closing
 from datetime import date, timezone
 from hashlib import sha256
 from io import BytesIO
-from pathlib import Path
-from tempfile import TemporaryDirectory
-from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from archive import decode, encode
@@ -21,19 +16,12 @@ from prepared import PREPARED_VERSION, digest, json_bytes
 
 SHARED_REMOTE = "https://github.com/trask/otel-pr-review-metrics.git"
 DATA_REF = "refs/heads/data"
-ARCHIVE_NAME = "archive.sqlite3"
-MAX_LEGACY_SNAPSHOT = 95_000_000
 MANIFEST = "schema.json"
 FORMAT = {"format": 1}
 HASH = r"[0-9a-f]{64}"
 ASSESSMENT_FILE = rf"\.assessment\.({HASH})\.json"
 PR_FILE = re.compile(rf"(\d{{4}}-\d{{2}})/([1-9]\d*)(\.json|\.evidence\.json\.gz|{ASSESSMENT_FILE})")
 MAX_RECORD_BYTES = 16_000_000
-TABLES = {
-    "pulls": ("repo, number, merged_day, merged, payload", (0, 1)),
-    "complete_days": ("repo, day", (0, 1)),
-    "evidence": ("request, payload", (0,)),
-}
 PROBABLE_SECRET = re.compile(
     rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s+>]*[A-Za-z0-9+/]{24,}"
     rb"|\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{70,}|"
@@ -42,31 +30,6 @@ PROBABLE_SECRET = re.compile(
 )
 URL_AUTH = re.compile(rb"""https?://[^\s:/"\\@]+:([^\s/"\\@]+)@""")
 PLACEHOLDER = re.compile(rb"(?i)(?:pass(?:word)?|token|secret|xxx+|\$\{?[\w.-]+\}?|\*+)")
-
-
-def public_revision_request(key, repositories):
-    url = urlsplit(key)
-    fields = url.path.split("/", 4)
-    if url.scheme or url.netloc or url.fragment or len(fields) != 5 or fields[0] != "repos":
-        return False
-    if "/".join(fields[1:3]) not in repositories:
-        return False
-    query = parse_qs(url.query)
-    kind, resource = fields[3:]
-    if kind == "contents":
-        return bool(resource and query.keys() == {"ref"} and len(query["ref"]) == 1
-                    and object_id(query["ref"][0]))
-    if query.keys() != {"page", "per_page"} or any(
-        len(values) != 1 or not re.fullmatch(r"[1-9][0-9]{0,5}", values[0])
-        for values in query.values()
-    ):
-        return False
-    if kind == "commits":
-        return bool(object_id(resource))
-    if kind == "compare":
-        ids = resource.split("...")
-        return len(ids) == 2 and all(map(object_id, ids))
-    return False
 
 
 def safe_payload(payload):
@@ -166,7 +129,6 @@ class SharedData:
         self.cwd = cwd
         self.tip = None
         self.imported = {}
-        self.legacy = False
 
     def git(self, *args, binary=False, input=None):
         result = run_command(["git", "--no-pager", *args], binary=binary, input=input, cwd=self.cwd)
@@ -174,17 +136,6 @@ class SharedData:
             error = result.stderr.decode("utf-8", errors="replace") if binary else result.stderr
             raise DataError(f"Shared data branch: git {args[0]} failed: {error.strip()}")
         return result.stdout if binary else result.stdout.strip()
-
-    def rows(self, db, table):
-        columns, keys = TABLES[table]
-        key_columns = columns.split(", ")
-        ordering = ", ".join(key_columns[i] for i in keys)
-        yield from db.execute(f"SELECT {columns} FROM {table} ORDER BY {ordering}")
-
-    def allowed(self, table, row):
-        if table == "evidence":
-            return public_revision_request(row[0], self.repositories)
-        return row[0] in self.repositories
 
     def blobs(self, entries):
         for offset in range(0, len(entries), 32):
@@ -221,21 +172,14 @@ class SharedData:
             if len(fields) != 4 or fields[:2] != ["100644", "blob"] or not object_id(fields[2]):
                 raise DataError("Shared data branch contains an unexpected Git entry")
             entries[path.decode()] = (fields[2], int(fields[3]))
-        self.legacy = len(entries) == 1 and any(name in entries for name in (ARCHIVE_NAME, ARCHIVE_NAME + "\r"))
-        if self.legacy:
-            oid, size = next(iter(entries.values()))
-            if size > MAX_LEGACY_SNAPSHOT:
-                raise DataError("Legacy shared archive exceeds the snapshot size limit")
-            self.load_legacy(self.git("cat-file", "blob", oid, binary=True))
-        else:
-            if MANIFEST not in entries or any(size > MAX_RECORD_BYTES for _, size in entries.values()):
-                raise DataError("Shared data branch is missing a manifest or contains an oversized file")
-            ordered = sorted(entries, key=lambda path: (
-                path != MANIFEST, ".assessment." in path, path.endswith(".gz"), path))
-            with self.archive.db:
-                for path, blob in self.blobs([(path, entries[path][0]) for path in ordered]):
-                    self.load_record(path, blob)
-                    self.imported[path] = sha256(blob).digest()
+        if MANIFEST not in entries or any(size > MAX_RECORD_BYTES for _, size in entries.values()):
+            raise DataError("Shared data branch is missing a manifest or contains an oversized file")
+        ordered = sorted(entries, key=lambda path: (
+            path != MANIFEST, ".assessment." in path, path.endswith(".gz"), path))
+        with self.archive.db:
+            for path, blob in self.blobs([(path, entries[path][0]) for path in ordered]):
+                self.load_record(path, blob)
+                self.imported[path] = sha256(blob).digest()
         self.tip = tip
 
     @staticmethod
@@ -245,27 +189,6 @@ class SharedData:
     @staticmethod
     def text_record(value):
         return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
-
-    def load_legacy(self, blob):
-        with TemporaryDirectory() as scratch:
-            path = Path(scratch) / ARCHIVE_NAME
-            path.write_bytes(blob)
-            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as incoming:
-                incoming.execute("PRAGMA trusted_schema=OFF")
-                with self.archive.db:
-                    for table, (columns, _) in TABLES.items():
-                        for row in self.rows(incoming, table):
-                            if not self.allowed(table, row):
-                                raise DataError(f"Unexpected repository or endpoint in shared {table}")
-                            if table != "complete_days":
-                                decode(row[-1])
-                            if table == "pulls":
-                                name = self.pull_file(row[0], row[2], row[1])
-                                self.imported[name] = sha256(self.text_record(decode(row[-1]))).digest()
-                            values = ",".join(["?"] * len(row))
-                            self.archive.db.execute(
-                                f"INSERT OR REPLACE INTO {table} ({columns}) VALUES ({values})", row
-                            )
 
     def load_record(self, path, blob):
         if path == MANIFEST:
@@ -373,33 +296,29 @@ class SharedData:
         stream = bytearray(f"commit {ref}\ncommitter {identity}\ndata {len(message)}\n".encode())
         stream.extend(message)
         stream.extend(f"\nfrom {self.tip}\n".encode())
-        if self.legacy:
-            stream.extend(b"deleteall\n")
         seen = {path: value for path, value in self.imported.items()
                 if re.search(ASSESSMENT_FILE + "$", path)}
         for path, blob, payload in self.local_records(include_assessments):
             seen[path] = sha256(blob).digest()
             if len(blob) > MAX_RECORD_BYTES:
                 raise DataError(f"Shared record is too large: {path}")
-            changed = seen[path] != self.imported.get(path)
-            if payload is not None and changed and not safe_payload(payload):
-                raise DataError(f"Shared publication withheld: {path} did not pass the public-data check.")
-            if not (self.legacy or changed):
+            if seen[path] == self.imported.get(path):
                 continue
+            if payload is not None and not safe_payload(payload):
+                raise DataError(f"Shared publication withheld: {path} did not pass the public-data check.")
             stream.extend(f"M 100644 inline {path}\ndata {len(blob)}\n".encode())
             stream.extend(blob)
             stream.extend(b"\n")
-        if not self.legacy and seen == self.imported:
+        if seen == self.imported:
             return None
-        if not self.legacy:
-            for path in sorted(self.imported.keys() - seen.keys()):
-                stream.extend(f"D {path}\n".encode())
+        for path in sorted(self.imported.keys() - seen.keys()):
+            stream.extend(f"D {path}\n".encode())
         stream.extend(b"\ndone\n")
         try:
             self.git("fast-import", "--quiet", "--done", binary=True, input=bytes(stream))
             commit = self.git("rev-parse", ref)
             self.git("push", "--quiet", self.remote, f"{commit}:{DATA_REF}")
-            self.tip, self.imported, self.legacy = commit, seen, False
+            self.tip, self.imported = commit, seen
             return commit
         finally:
             self.git("update-ref", "-d", ref)

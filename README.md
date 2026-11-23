@@ -15,6 +15,8 @@ python scorecard.py report
 
 The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outside the worktree. Use `--archive PATH` to use another local file. `load-data` downloads the public `data` branch over Git without calling the GitHub API. The branch stores a coverage file per repository and, by UTC merge month, a JSON file per merged PR plus a compressed evidence file where one has been prepared.
 
+`load-data` supports the per-PR format only. The original SQLite snapshot remains in the `data` branch history.
+
 ```sh
 python scorecard.py capture --with-evidence --publish-data
 ```
@@ -50,3 +52,5 @@ The first model pass reads the inline thread openers on a PR, classifies what th
 A thread opens when GitHub publishes it, not when it was drafted. A commit timestamp is not proof of when a change was pushed or why it was made. The agent uses Unclear if a matching change cannot be placed before or after publication, or if the evidence is otherwise insufficient. The scorecard marks missing assessments as N/M. GitHub does not expose deleted comments, so the report can only measure threads whose openers remain observable.
 
 Classification and outcome judgments have separate cache keys based on their prompts, model, reasoning effort, and inputs. Completed judgments are saved even if a later judgment fails. Editing the outcome prompt does not invalidate classifications. Each completed assessment has a versioned JSON audit file under `audit` next to the database, with reasoning and evidence links. Use `report --assessment-version HASH` to render a previous version using the full `assessment_version` in its audit file. The aggregate HTML contains no raw comments or individual assessments.
+
+When changing the prompts or assessment rules, set a new `ASSESSMENT_VERSION` in `assessment.py`. Changes to what capture collects already change the evidence digest if they produce a different bundle.

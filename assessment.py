@@ -18,6 +18,8 @@ KINDS = ("bug", "test coverage gap", "improvement")
 OUTCOMES = ("addressed", "unaddressed", "unclear", "duplicate", "other")
 DEFAULT_REASONING_EFFORT = "high"
 REASONING_EFFORTS = ("medium", "high")
+# Bump when the assessment rules change. Prepared evidence has its own digest.
+ASSESSMENT_VERSION = "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313"
 MAX_PATHS = 4
 MAX_COMMITS = 12
 MAX_INPUT = 180_000

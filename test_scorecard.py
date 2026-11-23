@@ -12,9 +12,7 @@ from assessment import AssessmentError, Copilot, Evidence, classify, judge
 from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from prepared import PREPARED_VERSION, digest, prepare
-from scorecard import (
-    ASSESSMENT_VERSION, AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render,
-)
+from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
 
@@ -23,6 +21,20 @@ def git_at(path, *args, **kwargs):
     if result.returncode:
         raise RuntimeError(result.stderr)
     return result.stdout.strip()
+
+
+def shared_remote(root):
+    repo_path, remote = root / "work", root / "remote.git"
+    repo_path.mkdir()
+    git_at(repo_path, "init", "--quiet")
+    git_at(repo_path, "config", "user.name", "Scorecard fixture")
+    git_at(repo_path, "config", "user.email", "fixture@example.test")
+    git_at(repo_path, "init", "--quiet", "--bare", str(remote))
+    (repo_path / "schema.json").write_text('{"format": 1}\n', encoding="utf-8")
+    git_at(repo_path, "add", "schema.json")
+    git_at(repo_path, "commit", "--quiet", "-m", "Initialize shared data")
+    git_at(repo_path, "push", "--quiet", str(remote), "HEAD:refs/heads/data")
+    return repo_path, remote
 
 
 def pilot_cases(root):
@@ -76,20 +88,7 @@ class CollectionTests(unittest.TestCase):
     def test_shared_data_round_trip_uses_only_public_tables(self):
         with TemporaryDirectory() as work:
             root = Path(work)
-            repo_path, remote = root / "work", root / "remote.git"
-            repo_path.mkdir()
-            git_at(repo_path, "init", "--quiet")
-            git_at(repo_path, "config", "user.name", "Scorecard fixture")
-            git_at(repo_path, "config", "user.email", "fixture@example.test")
-            git_at(repo_path, "init", "--quiet", "--bare", str(remote))
-            source = root / "archive.sqlite3"
-            with closing(Archive(source)) as initial:
-                initial.db.execute("PRAGMA journal_mode=DELETE")
-            blob = git_at(repo_path, "hash-object", "-w", str(source))
-            tree = git_at(repo_path, "mktree", "-z", binary=True,
-                          input=f"100644 blob {blob}\tarchive.sqlite3\r\0".encode()).decode()
-            tip = git_at(repo_path, "commit-tree", tree, "-m", "Initial snapshot")
-            git_at(repo_path, "push", "--quiet", str(remote), f"{tip}:refs/heads/data")
+            repo_path, remote = shared_remote(root)
             with closing(Archive(root / "writer.sqlite3")) as writer:
                 shared = SharedData(writer, REPOS, remote=str(remote), cwd=repo_path)
                 shared.load()
@@ -130,20 +129,12 @@ class CollectionTests(unittest.TestCase):
                 ]}
         bundle = {"version": PREPARED_VERSION, "input": digest(pull), "records": [{"url": link}],
                   "threads": {"first": {"records": {"merge-commit": 0}}, "duplicate": {"records": {}}}}
-        old = "a" * 64
+        unpinned_version = "a" * 64
+        published_version = "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313"
         model = "test-model"
         with TemporaryDirectory() as work:
             root = Path(work)
-            repo_path, remote = root / "work", root / "remote.git"
-            repo_path.mkdir()
-            git_at(repo_path, "init", "--quiet")
-            git_at(repo_path, "config", "user.name", "Scorecard fixture")
-            git_at(repo_path, "config", "user.email", "fixture@example.test")
-            git_at(repo_path, "init", "--quiet", "--bare", str(remote))
-            (repo_path / "schema.json").write_text('{"format": 1}\n', encoding="utf-8")
-            git_at(repo_path, "add", "schema.json")
-            git_at(repo_path, "commit", "--quiet", "-m", "Initialize shared data")
-            git_at(repo_path, "push", "--quiet", str(remote), "HEAD:refs/heads/data")
+            repo_path, remote = shared_remote(root)
 
             def shared(archive, repos):
                 return SharedData(archive, repos, remote=str(remote), cwd=repo_path)
@@ -158,8 +149,8 @@ class CollectionTests(unittest.TestCase):
                                       (repo, 1, day, pull["merged"], encode(pull)))
                 writer.put_prepared(repo, 1, bundle)
                 for version, effort, status in (
-                    (old, None, "unaddressed"), (ASSESSMENT_VERSION, "medium", "unclear"),
-                    (ASSESSMENT_VERSION, "high", "addressed"),
+                    (unpinned_version, None, "unaddressed"), (published_version, "medium", "unclear"),
+                    (published_version, "high", "addressed"),
                 ):
                     key = judgment_key(model, [version, pull, digest(bundle)], effort)
                     result = {"assessment_version": version, "model": model, "evidence_digest": digest(bundle),
@@ -188,7 +179,7 @@ class CollectionTests(unittest.TestCase):
                 self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>0</td><td>0</td><td>0</td>",
                               html.read_text(encoding="utf-8"))
                 self.assertIn("test-model (medium reasoning effort)", html.read_text(encoding="utf-8"))
-                self.assertEqual(main(["report", "--archive", str(fresh), "--assessment-version", old,
+                self.assertEqual(main(["report", "--archive", str(fresh), "--assessment-version", unpinned_version,
                                        "--reasoning-effort", "unpinned", *options]), 0)
                 self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>1</td><td>0</td><td>0</td>",
                               html.read_text(encoding="utf-8"))
