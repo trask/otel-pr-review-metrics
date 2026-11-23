@@ -114,10 +114,10 @@ class Archive:
                 )
         return added
 
-    def get_prepared(self, pull):
+    def get_prepared(self, pull, version=PREPARED_VERSION):
         row = self.db.execute(
             "SELECT input_digest, payload FROM prepared_evidence WHERE repo = ? AND number = ? AND version = ?",
-            (pull["repo"], pull["number"], PREPARED_VERSION),
+            (pull["repo"], pull["number"], version),
         ).fetchone()
         return decode(row[1]) if row and row[0] == digest(pull) else None
 

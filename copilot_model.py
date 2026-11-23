@@ -106,8 +106,12 @@ class Copilot:
                 self._runner = None
 
     def ask(self, instructions, data):
+        from shared_data import safe_payload
+
         if input_size(instructions, data) > MAX_INPUT:
             raise AssessmentError("Evidence exceeds the model input budget")
+        if not safe_payload(data):
+            raise AssessmentError("The evidence failed the public-data check")
         self.start()
         try:
             text = self._runner.run(self._ask(instructions, evidence_prompt(data)))

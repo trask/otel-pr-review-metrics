@@ -114,8 +114,8 @@ li + li { margin-top: 4px; }
       <li>Each inline thread counts once under its opener, and only if it was published before merge. Replies can provide evidence. Review summaries, approvals and general PR comments do not count.</li>
       <li>Automated combines GitHub Copilot and the custom reviewer. Other known automation and unavailable authors are shown separately when present. Human uses GitHub User accounts after excluding known automation.</li>
       <li>A finding flags a concrete bug, test coverage gap or improvement. A request for a regression test is a coverage gap unless it flags a current bug. The scorecard does not judge whether the claim was correct.</li>
-      <li>Addressed requires a matching change after the thread opened that survives at merge. The model compares the reviewed revision, later commits and the merged tree. A reply is optional. Resolution alone is insufficient, and a matching change does not establish cause.</li>
-      <li>Unaddressed means the check found no matching change. Unclear means the evidence did not settle the outcome.</li>
+      <li>$addressed_note</li>
+      <li>$unaddressed_note Unclear means the evidence did not settle the outcome.</li>
       <li>A later thread is a duplicate only if it flags the same concrete problem and needs no separate fix. Only the original counts as a finding. Questions without a concrete finding and unclassifiable threads are Other.</li>
       <li>Findings per merged PR includes original findings with unclear outcomes, but excludes reviewers outside Automated and Human. The overall rate divides summed findings by summed merged PRs.</li>
       <li>N/M means not measured. N/A means there were no merged PRs for a rate. A zero is a measured count.</li>

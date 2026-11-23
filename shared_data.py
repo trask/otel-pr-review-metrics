@@ -7,10 +7,10 @@ from io import BytesIO
 from uuid import uuid4
 
 from archive import decode, encode
-from assessment import KINDS, OUTCOMES, REASONING_EFFORTS
+from assessment import CHANGE_TIMINGS, KINDS, LOCAL_ASSESSMENT_VERSIONS, OUTCOMES, REASONING_EFFORTS
 from github_data import DataError, instant, run_command
 from git_evidence import object_id
-from prepared import PREPARED_VERSION, digest, json_bytes
+from prepared import SUPPORTED_PREPARED_VERSIONS, digest, json_bytes
 
 
 SHARED_REMOTE = "https://github.com/trask/otel-pr-review-metrics.git"
@@ -19,7 +19,8 @@ MANIFEST = "schema.json"
 FORMAT = {"format": 1}
 HASH = r"[0-9a-f]{64}"
 ASSESSMENT_FILE = rf"\.assessment\.({HASH})\.json"
-PR_FILE = re.compile(rf"(\d{{4}}-\d{{2}})/([1-9]\d*)(\.json|\.evidence\.json\.gz|{ASSESSMENT_FILE})")
+EVIDENCE_FILE = r"\.evidence(?:\.v([2-9]|[1-9]\d+))?\.json\.gz"
+PR_FILE = re.compile(rf"(\d{{4}}-\d{{2}})/([1-9]\d*)(\.json|{ASSESSMENT_FILE}|{EVIDENCE_FILE})")
 MAX_RECORD_BYTES = 16_000_000
 PROBABLE_SECRET = re.compile(
     rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s+>]*[A-Za-z0-9+/]{24,}"
@@ -89,6 +90,13 @@ def public_assessment(pull, result, key, *, bundle=None):
             decision["original"] = original
         elif kind:
             originals[thread["id"]] = thread["opened"]
+            if "change_timing" in row or "regressed" in row:
+                timing, regressed = row.get("change_timing"), row.get("regressed")
+                if (timing not in CHANGE_TIMINGS or type(regressed) is not bool
+                        or (regressed and (status != "unaddressed" or timing == "unknown"))
+                        or (timing != "unknown" and status != "addressed" and not regressed)):
+                    invalid()
+                decision.update(change_timing=timing, regressed=regressed)
             links = row.get("evidence")
             if not isinstance(links, list) or any(
                 not isinstance(link, str)
@@ -199,7 +207,7 @@ class SharedData:
         parsed = PR_FILE.fullmatch(relative)
         if not parsed:
             raise DataError(f"Unexpected shared data file: {path}")
-        month, number, suffix, key = parsed.groups()
+        month, number, suffix, key, version = parsed.groups()
         number = int(number)
         if suffix == ".json":
             pull = json.loads(blob)
@@ -224,7 +232,8 @@ class SharedData:
         if len(payload) > MAX_RECORD_BYTES:
             raise DataError(f"Oversized prepared evidence: {path}")
         bundle = json.loads(payload)
-        if bundle["version"] != PREPARED_VERSION:
+        if (bundle["version"] not in SUPPORTED_PREPARED_VERSIONS
+                or bundle["version"] != int(version or "1")):
             raise DataError(f"Unsupported prepared evidence version: {path}")
         if not row or not row[0].startswith(month + "-") or digest(decode(row[1])) != bundle["input"]:
             raise DataError(f"Prepared evidence doesn't match its pull request: {path}")
@@ -238,23 +247,25 @@ class SharedData:
                                               (repo,))
             yield f"{repo}/coverage.json", self.text_record([day for (day,) in complete]), None
             rows = self.archive.db.execute("""
-                SELECT p.number, p.merged_day, p.payload, e.input_digest, e.payload
-                FROM pulls p LEFT JOIN prepared_evidence e
-                 ON e.repo = p.repo AND e.number = p.number AND e.version = ?
-                WHERE p.repo = ? ORDER BY p.merged_day, p.number
-            """, (PREPARED_VERSION, repo))
-            for number, day, raw, input_digest, bundle in rows:
+                SELECT number, merged_day, payload FROM pulls
+                WHERE repo = ? ORDER BY merged_day, number
+            """, (repo,))
+            for number, day, raw in rows:
                 pull = decode(raw)
                 if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or number < 1:
                     raise DataError("Invalid local PR identity")
                 name = self.pull_file(repo, day, number)
                 yield name, self.text_record(pull), pull
-                if bundle and input_digest == digest(pull):
-                    evidence = decode(bundle)
+                for version in SUPPORTED_PREPARED_VERSIONS:
+                    evidence = self.archive.get_prepared(pull, version)
+                    if evidence is None:
+                        continue
                     data = json_bytes(evidence)
                     if len(data) > MAX_RECORD_BYTES:
                         raise DataError(f"Prepared evidence is too large for {repo}#{number}")
-                    yield name.removesuffix(".json") + ".evidence.json.gz", gzip.compress(data, mtime=0), evidence
+                    suffix = "" if version == 1 else f".v{version}"
+                    yield (name.removesuffix(".json") + f".evidence{suffix}.json.gz",
+                           gzip.compress(data, mtime=0), evidence)
                     if include_assessments and pull["threads"]:
                         yield from self.assessment_records(repo, number, name, pull, evidence)
 
@@ -268,7 +279,8 @@ class SharedData:
             if path in self.imported:
                 continue
             result = decode(payload)
-            if result.get("evidence_digest") != evidence_digest:
+            if (result.get("assessment_version") in LOCAL_ASSESSMENT_VERSIONS
+                    or result.get("evidence_digest") != evidence_digest):
                 continue
             record = public_assessment(pull, result, key, bundle=evidence)
             yield path, self.text_record(record), record

@@ -9,11 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from archive import Archive, encode
-from assessment import ASSESSMENT_VERSION, CLASSIFY, CLASSIFY_BATCH, DEDUPLICATE, JUDGE, classify, judge
+from assessment import (ASSESSMENT_VERSION, CLASSIFY, CLASSIFY_BATCH, DEDUPLICATE, JUDGE, LOOKUP_JUDGE,
+                        LOCAL_ASSESSMENT_VERSIONS, assess, classify, judge)
 from copilot_model import AssessmentError, Copilot, input_size
 from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
-from prepared import PREPARED_VERSION, Evidence, digest, prepare
+from outcome_evidence import OutcomeEvidence
+from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
 from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -63,7 +65,8 @@ def pilot_cases(root):
                   "author": {"login": "person", "__typename": "User"},
                   "body": "This rejects 18-year-olds. The minimum age is inclusive.",
                   "hunk": "+    return age > 18"}
-        pull = {"repo": REPOS[0], "number": 1, "head": head, "merge": head,
+        merge = git_at(root, "commit-tree", head + "^{tree}", "-p", reviewed, "-m", "Squash PR")
+        pull = {"repo": REPOS[0], "number": 1, "head": head, "merge": merge,
                 "merged": "2026-10-01T13:50:00Z", "threads": [thread], "missing_roots": 0}
         evidence = Evidence(root, pull)
         evidence.git.path = root / ".git"
@@ -99,10 +102,12 @@ class CollectionTests(unittest.TestCase):
                 pull = {"repo": REPOS[0], "number": 1, "merged": "2026-10-01T10:00:00Z",
                         "threads": [], "missing_roots": 0}
                 bundle = {"version": PREPARED_VERSION, "input": digest(pull), "threads": {}, "records": []}
+                legacy = dict(bundle, version=1)
                 with writer.db:
                     writer.db.execute("INSERT INTO complete_days VALUES (?, ?)", (REPOS[0], "2026-10-01"))
                     writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                       (REPOS[0], 1, "2026-10-01", pull["merged"], encode(pull)))
+                writer.put_prepared(REPOS[0], 1, legacy)
                 writer.put_prepared(REPOS[0], 1, bundle)
                 writer.put_judgment(REPOS[0], 1, "judge", "test", {"status": "addressed"})
                 updated = shared.publish()
@@ -110,11 +115,13 @@ class CollectionTests(unittest.TestCase):
                 self.assertIn(f"{REPOS[0]}/coverage.json", files)
                 self.assertIn(f"{REPOS[0]}/2026-10/1.json", files)
                 self.assertIn(f"{REPOS[0]}/2026-10/1.evidence.json.gz", files)
+                self.assertIn(f"{REPOS[0]}/2026-10/1.evidence.v{PREPARED_VERSION}.json.gz", files)
                 self.assertNotIn("archive.sqlite3", files)
             with closing(Archive(root / "reader.sqlite3")) as reader:
                 SharedData(reader, REPOS, remote=str(remote), cwd=repo_path).load()
                 self.assertEqual(reader.pending_days(REPOS[0], BASELINE[0], BASELINE[0]), [])
                 self.assertEqual(reader.get_prepared(pull), bundle)
+                self.assertEqual(reader.get_prepared(pull, 1), legacy)
                 self.assertIsNone(reader.get_judgment(REPOS[0], 1, "judge", "test"))
 
     def test_published_results_are_versioned_and_reusable_without_a_model(self):
@@ -309,7 +316,7 @@ class AssessmentTests(unittest.TestCase):
                 archive.put_prepared(pull["repo"], 1, bundle)
             model = Mock(model="test-model", reasoning_effort="high")
             model.ask.side_effect = [
-                [{"id": "thread", "kind": "bug", "paths": [], "reason": "Rejects adults."}],
+                [{"id": "thread", "kind": "bug", "reason": "Rejects adults."}],
                 {"status": "unclear", "evidence": ["comparison"], "reason": "Timing is unclear."},
             ]
             with patch("scorecard.GitHub", side_effect=AssertionError("assessment must not call REST")), \
@@ -324,16 +331,94 @@ class AssessmentTests(unittest.TestCase):
     def test_git_evidence_separates_a_draft_cutoff_and_a_reverted_fix(self):
         with TemporaryDirectory() as work:
             for label, pull, thread, evidence, _ in pilot_cases(Path(work)):
-                records = evidence.for_thread(thread, ["adult.py"])
+                _, records = evidence.for_thread(thread, evidence.changed_paths())
                 self.assertIn("return age > 18", records["reviewed-0"]["text"])
                 if label == "delayed draft":
-                    self.assertEqual(records["comparison"]["commits_dated_at_or_before_publication"], 1)
-                    self.assertNotIn("later-0", records)
+                    self.assertFalse(records["change-0"]["dated_after_publication"])
                     self.assertIn("return age >= 18", records["merged-0"]["text"])
                 else:
-                    self.assertIn("later-0", records)
-                    self.assertIn("later-1", records)
+                    self.assertTrue(records["change-0"]["dated_after_publication"])
+                    self.assertTrue(records["change-1"]["dated_after_publication"])
                     self.assertIn("return age > 18", records["merged-0"]["text"])
+
+    def test_ranks_a_related_pr_fix_before_later_upstream_commits(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            git_at(root, "init", "--quiet")
+            git_at(root, "config", "user.name", "Scorecard fixture")
+            git_at(root, "config", "user.email", "fixture@example.test")
+
+            def commit(minute, path, text):
+                (root / path).write_text(text, encoding="utf-8")
+                git_at(root, "add", "--", path)
+                stamp = f"2026-10-01T13:{minute:02d}:00Z"
+                git_at(root, "commit", "-qm", path,
+                       env=dict(os.environ, GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp))
+                return git_at(root, "rev-parse", "HEAD")
+
+            base = commit(0, "caller.py", "limit=18\n")
+            git_at(root, "branch", "upstream")
+            reviewed = commit(1, "helper.py", "def allowsAge(age): return age > 18\n")
+            fix = commit(3, "helper.py", "def allowsAge(age): return age >= 18\n")
+            branch = git_at(root, "branch", "--show-current")
+            git_at(root, "switch", "upstream")
+            upstream = [commit(i, "helper.py", f"# upstream {i}\n") for i in range(4, 19)]
+            # Keep the branches' files disjoint at the merge, while leaving upstream
+            # history with changes to the same path.
+            unmerged = upstream[-1]
+            (root / "helper.py").unlink()
+            git_at(root, "add", "-u")
+            git_at(root, "commit", "-qm", "Drop upstream file")
+            upstream_tip = git_at(root, "rev-parse", "HEAD")
+            git_at(root, "switch", branch)
+            head = git_at(root, "commit-tree", fix + "^{tree}", "-p", fix, "-p", upstream_tip,
+                          "-m", "Merge upstream")
+            merge = git_at(root, "commit-tree", head + "^{tree}", "-p", upstream_tip, "-m", "Squash")
+            thread = {"id": "thread", "path": "caller.py", "body": "helper.py allowsAge must accept age 18.",
+                      "opened": "2026-10-01T13:02:00Z", "reviewed": reviewed, "replies": []}
+            pull = {"repo": REPOS[0], "number": 1, "head": head, "merge": merge,
+                    "merged": "2026-10-01T13:50:00Z", "threads": [thread]}
+            evidence = Evidence(root, pull)
+            evidence.git.path = root / ".git"
+            evidence.git.ready = True
+            bundle = prepare(pull, evidence)
+            prepared = PreparedEvidence(bundle)
+            paths = prepared.paths()["thread"]
+            self.assertIn("helper.py", paths)
+            records = prepared.for_thread(thread, paths)
+            links = [item["url"].rsplit("/", 1)[-1] for k, item in records.items() if k.startswith("change-")]
+            self.assertEqual(links, [fix])
+            self.assertNotIn(unmerged, links)
+
+    def test_large_snapshot_shows_matching_code_after_the_prefix(self):
+        evidence = Evidence(Path("."), {"repo": REPOS[0], "number": 1, "head": None, "merge": None})
+        text = "# filler " + "x" * 100 + "\n"
+        state = Evidence.file_state(
+            (text * 180 + "if finish_reason is None:\n" + "\n" * 9 + '    return "stop"\n').encode()
+        )
+        with patch.object(evidence, "file", return_value=state):
+            result = evidence.snapshot("revision", "code.py", {"body": "Do not emit `finish_reason` as null."})
+        self.assertEqual(result["state"], "truncated")
+        self.assertIn('return "stop"', result["text"])
+        self.assertLessEqual(len(result["text"]), 14_000)
+
+    def test_named_schema_can_be_outside_the_pr_diff(self):
+        thread = {"id": "thread", "path": "code.py",
+                  "body": "Check `model/message.json` and `model/missing.json`.",
+                  "opened": "2026-10-01T13:02:00Z", "reviewed": "1" * 40}
+        pull = {"repo": REPOS[0], "number": 1, "head": None, "merge": "2" * 40,
+                "merged": "2026-10-01T13:50:00Z"}
+        evidence = Evidence(Path("."), pull)
+        with patch.object(evidence, "commit", return_value={"files": []}), \
+                patch.object(evidence, "pr_history", return_value=None), \
+                patch.object(evidence.git, "prefetch_patches"), \
+                patch.object(evidence, "file", side_effect=lambda _, path:
+                             {"state": "absent"} if path.endswith("/missing.json")
+                             else {"state": "text", "text": path}):
+            paths, records = evidence.for_thread(thread, {"code.py"})
+        self.assertEqual(paths, ["code.py", "model/message.json"])
+        self.assertEqual(records["reviewed-1"]["text"], "model/message.json")
+        self.assertEqual(records["merged-1"]["text"], "model/message.json")
 
     def test_missing_commit_is_unavailable_but_a_failed_fetch_stops(self):
         with TemporaryDirectory() as work:
@@ -394,20 +479,21 @@ class AssessmentTests(unittest.TestCase):
              "body": "This still needs a test."},
         ]
         answers = [
-            {"id": "a", "kind": "test coverage gap", "paths": [], "reason": "Missing test."},
+            {"id": "a", "kind": "test coverage gap", "paths": ["guessed.py"], "reason": "Missing test."},
             {"id": "b", "kind": "duplicate", "original": "a", "reason": "Same missing test."},
         ]
         model = Mock()
         model.ask.return_value = answers
-        rows = classify(model, {"threads": threads}, {"a": [], "b": []})
+        rows = classify(model, {"threads": threads})
         prompt, data = model.ask.call_args.args
         self.assertEqual(prompt, CLASSIFY)
-        self.assertEqual(set(data["threads"][0]), {"id", "opened", "path", "body", "available_paths"})
+        self.assertEqual(set(data["threads"][0]), {"id", "opened", "path", "body"})
+        self.assertNotIn("paths", rows[0])
         self.assertEqual((rows[1]["kind"], rows[1]["status"], rows[1]["original_url"]),
                          (None, "duplicate", "original-url"))
         threads[1]["opened"] = threads[0]["opened"]
         with self.assertRaises(AssessmentError):
-            classify(FakeModel(answers), {"threads": threads}, {"a": [], "b": []})
+            classify(FakeModel(answers), {"threads": threads})
 
     def test_split_classification_resumes_batches_and_links_across_them(self):
         threads = [
@@ -430,19 +516,19 @@ class AssessmentTests(unittest.TestCase):
             if prompt == DEDUPLICATE:
                 self.assertEqual([row["id"] for row in data["findings"]], ["a", "b", "c"])
                 return links
-            return [{"id": item["id"], "kind": "test coverage gap", "paths": [], "reason": "Missing test."}
+            return [{"id": item["id"], "kind": "test coverage gap", "reason": "Missing test."}
                     for item in data["threads"]]
 
         model = SimpleNamespace(ask=ask)
-        pull, paths = {"threads": threads}, {ident: [] for ident in "abc"}
+        pull = {"threads": threads}
         with patch("assessment.MAX_INPUT", 3500):
-            rows = classify(model, pull, paths, checkpoint)
+            rows = classify(model, pull, checkpoint)
             self.assertEqual(calls, [CLASSIFY_BATCH, CLASSIFY_BATCH, CLASSIFY_BATCH, DEDUPLICATE])
             self.assertEqual((rows[2]["original"], rows[2]["original_url"]), ("a", "url-a"))
             links.append({"id": "b", "original": "c", "reason": "Invalid chain."})
             calls.clear()
             with self.assertRaisesRegex(AssessmentError, "earlier original"):
-                classify(model, pull, paths, checkpoint)
+                classify(model, pull, checkpoint)
             self.assertEqual(calls, [DEDUPLICATE])
 
     def test_prioritizes_split_prs_ahead_of_earlier_repositories(self):
@@ -457,19 +543,113 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual([(pull["number"], evidence) for pull, evidence in assessment_order(archive, BASELINE, True)],
                          [(2, bundle), (1, None)])
 
-    def test_addressed_needs_a_matching_later_patch_and_merge_state(self):
+    def test_addressed_is_independent_of_fix_timing(self):
         records = {
             "reviewed-0": {"url": "reviewed-url", "state": "text", "path": "code.py"},
             "merged-0": {"url": "merged-url", "state": "text", "path": "code.py"},
-            "later-0": {"url": "later-url"},
+            "change-0": {"url": "later-url", "dated_after_publication": True},
         }
         reply = {"status": "addressed", "reason": "Matching code is kept.",
                  "evidence": ["reviewed-0", "merged-0"]}
         args = ({"merged": "time"}, {}, {"paths": ["code.py"]}, records)
+        self.assertEqual(judge(FakeModel(reply), *args)["status"], "addressed")
+        self.assertEqual(judge(FakeModel(reply), *args)["change_timing"], "unknown")
+        reply["fix"] = "change-0"
+        self.assertEqual(judge(FakeModel(reply), *args)["change_timing"], "dated_after_publication")
+        reply["status"], reply["regressed"] = "unaddressed", True
+        self.assertTrue(judge(FakeModel(reply), *args)["regressed"])
+        reply["evidence"] = ["merged-url", "not-supplied"]
         self.assertEqual(judge(FakeModel(reply), *args)["status"], "unclear")
-        reply["evidence"].append("later-0")
-        self.assertEqual(judge(FakeModel(reply), *args)["evidence"],
-                         ["reviewed-url", "merged-url", "later-url"])
+
+    def test_change_budget_can_retain_more_than_twelve_small_diffs(self):
+        changes = [{"patch": "x" * 1000}, *({"patch": str(i)} for i in range(15))]
+        self.assertEqual(list(pack_changes(changes, 250)), changes[1:])
+
+    def test_git_lookup_uses_archived_revisions_and_rejects_non_repo_paths(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            _, pull, thread, evidence, _ = next(pilot_cases(root))
+            retrieval = OutcomeEvidence(root, pull)
+            retrieval.source = evidence
+            denied, _ = retrieval.lookup(thread, {"action": "read", "path": "../local", "query": ""}, "0")
+            self.assertEqual(denied, {})
+            snapshots, _ = retrieval.lookup(thread, {"action": "search", "path": None, "query": "is_adult"}, "1")
+            self.assertIn("age > 18", snapshots["reviewed-lookup-1-0"]["text"])
+            self.assertIn("age >= 18", snapshots["merged-lookup-1-0"]["text"])
+            changes, _ = retrieval.lookup(
+                thread, {"action": "history", "path": "adult.py", "query": "age >= 18"}, "2")
+            self.assertFalse(changes["change-lookup-2-0"]["dated_after_publication"])
+            self.assertIn("+    return age >= 18", changes["change-lookup-2-0"]["patches"][0]["patch"])
+
+    def test_judge_validates_citations_against_retrieved_records_and_limits_requests(self):
+        requested = {"lookup": {"action": "read", "path": "helper.py", "query": ""}}
+        added = {f"{side}-lookup-0": {"url": side, "state": "text"} for side in ("reviewed", "merged")}
+        retrieval = Mock()
+        retrieval.lookup.side_effect = [(added, "Read"), ({}, "No more evidence")]
+        model = Mock()
+        model.ask.side_effect = [requested, requested, {
+            "status": "addressed", "reason": "The check is gone.", "evidence": list(added),
+        }]
+        result = judge(model, {"merged": "time"}, {}, {}, {}, retrieval=retrieval)
+        self.assertEqual((result["status"], result["evidence"]), ("addressed", ["reviewed", "merged"]))
+        self.assertEqual([call.args[0] for call in model.ask.call_args_list], [LOOKUP_JUDGE, LOOKUP_JUDGE, JUDGE])
+        self.assertEqual(retrieval.lookup.call_count, 2)
+
+    def test_retrieval_reuses_static_judgments_and_only_retries_unclear_findings(self):
+        threads = [
+            {"id": ident, "url": ident, "body": "Rejects adults.", "path": "adult.py", "opened": "time"}
+            for ident in ("addressed", "unaddressed", "unclear", "other")
+        ]
+        pull = {"repo": REPOS[0], "head": "head", "merge": "merge", "merged": "time", "threads": threads}
+        records = [{"url": side, "state": "text", "path": "adult.py"} for side in ("reviewed", "merged")]
+        bundle = {"records": records, "threads": {
+            t["id"]: {"paths": ["adult.py"], "omitted_related_paths": 0,
+                      "records": {"reviewed-0": 0, "merged-0": 1}}
+            for t in threads
+        }}
+        rows = [{"id": t["id"], "kind": "other" if t["id"] == "other" else "bug", "reason": "Age check."}
+                for t in threads]
+        citations = ["reviewed-0", "merged-0"]
+        added = {f"{side}-lookup-0": {"url": f"{side}-helper", "state": "text"}
+                 for side in ("reviewed", "merged")}
+        request = {"action": "read", "path": "helper.py", "query": ""}
+        retrieval = Mock()
+        retrieval.lookup.return_value = added, "Read"
+        model = Mock()
+        model.ask.side_effect = [
+            rows, *({"status": t["id"], "reason": t["id"], "evidence": citations} for t in threads[:3]),
+            {"lookup": request}, {"status": "addressed", "reason": "Helper fixed it.", "evidence": list(added)},
+        ]
+        saved = {}
+
+        def checkpoint(stage, inputs, evaluate):
+            key = stage, digest(inputs)
+            if key not in saved:
+                saved[key] = evaluate()
+            return saved[key]
+
+        first = assess(bundle, model, pull, checkpoint)
+        retried = assess(bundle, model, pull, checkpoint, retrieval=retrieval)
+        self.assertEqual([first[i] for i in (0, 1, 3)], [retried[i] for i in (0, 1, 3)])
+        self.assertEqual(retried[2]["first_pass"]["status"], "unclear")
+        self.assertEqual((retried[2]["status"], retried[2]["evidence"]),
+                         ("addressed", ["reviewed-helper", "merged-helper"]))
+        retrieval.lookup.assert_called_once_with(threads[2], request, "0")
+        self.assertEqual(retried, assess(bundle, model, pull, checkpoint, retrieval=retrieval))
+        self.assertEqual([call.args[0] for call in model.ask.call_args_list],
+                         [CLASSIFY, JUDGE, JUDGE, JUDGE, LOOKUP_JUDGE, LOOKUP_JUDGE])
+
+    def test_local_retrieval_result_is_never_selected_for_publication(self):
+        pull = {"repo": REPOS[0], "number": 1}
+        bundle = {"records": []}
+        with TemporaryDirectory() as work, closing(Archive(Path(work) / "archive.sqlite3")) as archive:
+            for version in LOCAL_ASSESSMENT_VERSIONS:
+                archive.put_judgment(pull["repo"], 1, "complete", version, {
+                    "assessment_version": version, "evidence_digest": digest(bundle),
+                })
+            shared = SharedData(archive, REPOS)
+            shared.imported = {}
+            self.assertEqual(list(shared.assessment_records(pull["repo"], 1, "1.json", pull, bundle)), [])
 
     @unittest.skipIf(sys.version_info < (3, 11), "SDK requires Python 3.11")
     def test_sdk_reuses_client_but_replaces_prompt_in_each_tool_free_session(self):
@@ -497,31 +677,29 @@ class AssessmentTests(unittest.TestCase):
             "reviewed-0": {"url": "reviewed", "state": "text", "path": "a"},
             "merged-0": {"url": "merged", "state": "text", "path": "a"},
             "comparison": {"url": "comparison", "complete": True},
-            "later-0": {"url": "later"},
+            "change-0": {"url": "later", "dated_after_publication": True},
             "merge-commit": {"url": "merge-commit", "text": "x" * 180_000},
             "reply-0": {"url": "reply"},
         }
         model = Mock()
         model.ask.return_value = {"status": "addressed", "reason": "The fix survived.",
-                                  "evidence": ["reviewed-0", "merged-0", "later-0"]}
+                                  "evidence": ["reviewed-0", "merged-0"], "fix": "change-0"}
         thread = {"hunk": "hunk", "replies": [{"body": "reply"}]}
         args = (model, {"merged": "time"}, thread, {"paths": ["a"]}, records)
         self.assertEqual(judge(*args)["status"], "addressed")
         self.assertEqual(set(model.ask.call_args.args[1]["evidence"]),
-                         {"reviewed-0", "merged-0", "comparison", "later-0"})
+                         {"reviewed-0", "merged-0", "comparison", "change-0"})
         model.ask.reset_mock()
-        records["later-1"] = {"url": "oversized later", "text": "x" * 180_000}
+        records["change-1"] = {"url": "oversized later", "text": "x" * 180_000}
         self.assertEqual(judge(*args)["status"], "addressed")
         sent = model.ask.call_args.args[1]["evidence"]
-        self.assertNotIn("later-1", sent)
-        self.assertEqual(sent["comparison"]["later_commits_not_shown"], 1)
-        self.assertNotIn("later_commits_not_shown", records["comparison"])
+        self.assertNotIn("change-1", sent)
         model.ask.reset_mock()
         records["reviewed-0"]["text"] = "x" * 180_000
         self.assertEqual(judge(*args)["status"], "unclear")
         model.ask.assert_not_called()
 
-    def test_missing_comparison_cannot_establish_an_unaddressed_finding(self):
+    def test_merged_snapshot_can_establish_unaddressed_without_complete_history(self):
         records = {
             "reviewed-0": {"url": "reviewed-url", "state": "text", "path": "code.py"},
             "merged-0": {"url": "merged-url", "state": "text", "path": "code.py"},
@@ -530,7 +708,7 @@ class AssessmentTests(unittest.TestCase):
         reply = {"status": "unaddressed", "reason": "No matching change.",
                  "evidence": list(records)}
         args = ({"merged": "time"}, {}, {"paths": ["code.py"]}, records)
-        self.assertEqual(judge(FakeModel(reply), *args)["status"], "unclear")
+        self.assertEqual(judge(FakeModel(reply), *args)["status"], "unaddressed")
         records["comparison"]["complete"] = True
         self.assertEqual(judge(FakeModel(reply), *args)["status"], "unaddressed")
 

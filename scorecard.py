@@ -12,10 +12,12 @@ from string import Template
 from subprocess import TimeoutExpired
 
 from archive import DEFAULT_ARCHIVE, Archive
-from assessment import ASSESSMENT_VERSION, KINDS, OUTCOMES, REASONING_EFFORTS, assess, needs_classification_batches
+from assessment import (ASSESSMENT_VERSION, KINDS, OUTCOMES, REASONING_EFFORTS, RETRIEVAL_VERSION, assess,
+                        needs_classification_batches)
 from copilot_model import DEFAULT_REASONING_EFFORT, AssessmentSetupError, Copilot
 from github_data import DataError, GitHub
-from prepared import Evidence, PreparedEvidence, digest, prepare
+from outcome_evidence import OutcomeEvidence
+from prepared import Evidence, SUPPORTED_PREPARED_VERSIONS, digest, prepare
 from shared_data import SharedData, judgment_key
 
 
@@ -215,9 +217,16 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=
     identity_note = ("Custom reviewer logins: " + ", ".join(sorted(custom)) + "."
                      if custom else "No custom reviewer was configured for this baseline. "
                      "The Automated total uses GitHub Copilot only.")
+    legacy = version == digest("compact-sdk-v1") or version == (
+        "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313")
     return Template(TEMPLATE.read_text(encoding="utf-8")).substitute(
         overview="".join(overview), main="".join(main), types="".join(types),
         threads="".join(threads), identity_note=escape(identity_note),
+        addressed_note=("Addressed requires a matching change after the thread opened that survives at merge."
+                        if legacy else "Addressed means the issue shown in the reviewed code is gone at merge. "
+                        "A rewrite can address it. The audit records fix timing separately when a patch shows it."),
+        unaddressed_note=("Unaddressed means the check found no matching change." if legacy else
+                          "Unaddressed means the issue is still present at merge, even if it was fixed earlier."),
         model=escape(f"{model} ({reasoning_effort} reasoning effort)"),
         version=escape(version[:12]),
     )
@@ -230,19 +239,24 @@ def write_atomic(path, text):
     temp.replace(path)
 
 
-def assess_cached(archive, bundle, model, pull, audit, allow_model, version):
+def assess_cached(archive, bundle, model, pull, audit, allow_model, version, *, git_root=None):
     repo, number = pull["repo"], pull["number"]
 
     def fingerprint(inputs):
         return judgment_key(model.model, inputs, model.reasoning_effort)
 
-    key = fingerprint([version, pull, digest(bundle)])
-    saved = (archive.get_judgment(repo, number, "published", key)
-             or archive.get_judgment(repo, number, "complete", key))
-    if saved is not None:
-        return saved["threads"], False
+    bundles = [bundle]
+    if not allow_model and version != ASSESSMENT_VERSION:
+        bundles.extend(archive.get_prepared(pull, v) for v in reversed(SUPPORTED_PREPARED_VERSIONS[:-1]))
+    for saved_bundle in bundles:
+        key = fingerprint([version, pull, digest(saved_bundle)])
+        saved = (archive.get_judgment(repo, number, "published", key)
+                 or archive.get_judgment(repo, number, "complete", key))
+        if saved is not None:
+            return saved["threads"], False
     if not allow_model or bundle is None:
         return None, False
+    key = fingerprint([version, pull, digest(bundle)])
 
     def checkpoint(stage, inputs, evaluate):
         stage_key = fingerprint(inputs)
@@ -252,7 +266,10 @@ def assess_cached(archive, bundle, model, pull, audit, allow_model, version):
             archive.put_judgment(repo, number, stage, stage_key, result)
         return result
 
-    rows = assess(bundle, model, pull, checkpoint)
+    if git_root is None:
+        rows = assess(bundle, model, pull, checkpoint)
+    else:
+        rows = assess(bundle, model, pull, checkpoint, retrieval=OutcomeEvidence(git_root, pull))
     result = {
         "input_digest": key, "assessment_version": version,
         "model": model.model, "reasoning_effort": model.reasoning_effort,
@@ -287,7 +304,7 @@ def assessment_order(archive, dates, prioritize_oversized):
                 yield pull, None
                 continue
             bundle = archive.get_prepared(pull) if pull["threads"] else None
-            if bundle is not None and needs_classification_batches(pull, PreparedEvidence(bundle).paths()):
+            if bundle is not None and needs_classification_batches(pull):
                 log(f"Prioritizing split classification for {repo}#{pull['number']}")
                 yield pull, bundle
             else:
@@ -310,6 +327,7 @@ def collect(archive, args, model, windows, shared=None):
                     rows, ran = assess_cached(
                         archive, bundle if bundle is not None else archive.get_prepared(pull),
                         model, pull, args.audit_dir, allow, args.assessment_version,
+                        git_root=args.archive.parent / "git" if args.retrieve_evidence else None,
                     )
                 except AssessmentSetupError:
                     raise
@@ -390,6 +408,10 @@ def build_report(args, parser):
     args.other_bot = {login.lower() for login in args.other_bot}
     if assessing:
         args.audit_dir = args.audit_dir or args.archive.parent / "audit"
+        if args.retrieve_evidence:
+            if args.publish_data:
+                parser.error("--retrieve-evidence is local only and cannot be used with --publish-data")
+            args.assessment_version = RETRIEVAL_VERSION
     if args.custom_reviewer & (args.other_bot | COPILOT):
         parser.error("a custom reviewer login cannot also be another bot or GitHub Copilot")
     if assessing and args.max_prs is not None and args.max_prs < 0:
@@ -446,7 +468,7 @@ def main(argv=None):
 
     for command in (assessment, report):
         command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None,
-                             prioritize_oversized=False)
+                             prioritize_oversized=False, retrieve_evidence=False)
         command.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                              default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
         command.add_argument("--follow-up", nargs=2, type=date.fromisoformat, metavar=("START", "END"))
@@ -461,6 +483,8 @@ def main(argv=None):
     assessment.add_argument("--max-prs", type=int, help="limit new assessments to this many PRs")
     assessment.add_argument("--prioritize-oversized", action="store_true",
                             help="assess PRs that need classification batches first in each window")
+    assessment.add_argument("--retrieve-evidence", action="store_true",
+                            help="retry unclear outcomes with bounded read-only Git lookups (local only)")
     report.add_argument("--assessment-version", help="full assessment_version from a saved audit file")
 
     args = parser.parse_args(argv)
