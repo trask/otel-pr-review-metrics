@@ -11,9 +11,7 @@ class DataError(RuntimeError):
 
 
 class GitHubError(DataError):
-    def __init__(self, message):
-        super().__init__(message)
-        self.not_found = "(HTTP 404)" in message
+    pass
 
 
 class RateLimitError(GitHubError):

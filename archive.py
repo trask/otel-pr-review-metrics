@@ -4,7 +4,7 @@ import sqlite3
 from datetime import timedelta, timezone
 from pathlib import Path
 
-from github_data import DataError, GitHubError, endpoint, instant
+from github_data import DataError, instant
 from prepared import PREPARED_VERSION, digest
 
 
@@ -53,9 +53,6 @@ class Archive:
             CREATE INDEX IF NOT EXISTS pulls_by_day ON pulls(repo, merged_day, number);
             CREATE TABLE IF NOT EXISTS complete_days (
                 repo TEXT, day TEXT, PRIMARY KEY (repo, day)
-            );
-            CREATE TABLE IF NOT EXISTS evidence (
-                request TEXT PRIMARY KEY, payload BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS prepared_evidence (
                 repo TEXT, number INTEGER, version INTEGER, input_digest TEXT, payload BLOB NOT NULL,
@@ -140,34 +137,3 @@ class Archive:
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO judgments VALUES (?, ?, ?, ?, ?)",
                             (repo, number, stage, fingerprint, encode(value)))
-
-
-class ArchivedGitHub:
-    """Cache immutable revision requests for one verified public repository."""
-
-    def __init__(self, archive, github, repo, git_root=None):
-        self.archive = archive
-        self.github = github
-        self.repo = repo
-        self.git_root = git_root
-        self.verified = False
-
-    def get(self, path, **params):
-        if not path.startswith(f"repos/{self.repo}/"):
-            raise DataError("Evidence request is outside the archived repository")
-        key = endpoint(path, **dict(sorted(params.items())))
-        row = self.archive.db.execute("SELECT payload FROM evidence WHERE request = ?", (key,)).fetchone()
-        if row:
-            return decode(row[0])
-        if not self.verified:
-            self.github.public(self.repo)
-            self.verified = True
-        try:
-            item = self.github.get(path, **params)
-        except GitHubError as error:
-            if not error.not_found or not path.startswith(f"repos/{self.repo}/contents/"):
-                raise
-            item = None
-        with self.archive.db:
-            self.archive.db.execute("INSERT OR IGNORE INTO evidence VALUES (?, ?)", (key, encode(item)))
-        return item

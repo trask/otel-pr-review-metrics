@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from archive import Archive, ArchivedGitHub, encode
+from archive import Archive, encode
 from assessment import AssessmentError, Copilot, classify, judge
 from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
@@ -63,10 +63,9 @@ def pilot_cases(root):
                   "hunk": "+    return age > 18"}
         pull = {"repo": REPOS[0], "number": 1, "head": head, "merge": head,
                 "merged": "2026-10-01T13:50:00Z", "threads": [thread], "missing_roots": 0}
-        evidence = Evidence(Mock(), pull)
-        evidence.local = GitEvidence(root, REPOS[0], 1)
-        evidence.local.path = root / ".git"
-        evidence.local.ready = True
+        evidence = Evidence(root, pull)
+        evidence.git.path = root / ".git"
+        evidence.git.ready = True
         yield label, pull, thread, evidence, expected
 
 
@@ -232,20 +231,6 @@ class CollectionTests(unittest.TestCase):
             self.assertIn('<th scope="row">semantic-conventions-genai</th><td>2</td>',
                           output.read_text(encoding="utf-8"))
 
-    def test_reuses_code_evidence_in_later_runs(self):
-        path = f"repos/{REPOS[0]}/commits/revision"
-        github = Mock()
-        github.get.return_value = {"files": []}
-        with TemporaryDirectory() as work:
-            db = Path(work) / "archive.sqlite3"
-            with closing(Archive(db)) as archive:
-                self.assertEqual(ArchivedGitHub(archive, github, REPOS[0]).get(path), {"files": []})
-            github.reset_mock()
-            with closing(Archive(db)) as archive:
-                self.assertEqual(ArchivedGitHub(archive, github, REPOS[0]).get(path), {"files": []})
-            github.get.assert_not_called()
-            github.public.assert_not_called()
-
     def test_rate_limit_with_retry_after_stops_when_wait_is_too_long(self):
         result = SimpleNamespace(returncode=1, stderr="gh: secondary rate limit (HTTP 403)",
                                  stdout="HTTP/2 403 Forbidden\nRetry-After: 180\n\n{}")
@@ -338,7 +323,6 @@ class AssessmentTests(unittest.TestCase):
         with TemporaryDirectory() as work:
             for label, pull, thread, evidence, _ in pilot_cases(Path(work)):
                 records = evidence.for_thread(thread, ["adult.py"])
-                evidence.github.get.assert_not_called()
                 self.assertIn("return age > 18", records["reviewed-0"]["text"])
                 if label == "delayed draft":
                     self.assertEqual(records["comparison"]["commits_dated_at_or_before_publication"], 1)
@@ -348,6 +332,22 @@ class AssessmentTests(unittest.TestCase):
                     self.assertIn("later-0", records)
                     self.assertIn("later-1", records)
                     self.assertIn("return age > 18", records["merged-0"]["text"])
+
+    def test_missing_commit_is_unavailable_but_a_failed_fetch_stops(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            source = root / "source"
+            source.mkdir()
+            _, pull, *_ = next(pilot_cases(source))
+            missing = "1" * 40
+            git = GitEvidence(root / "cache", REPOS[0], 1)
+            git.url = str(source)
+            git.prepare([pull["head"], missing])
+            self.assertEqual((git.checked, git.unavailable), ({pull["head"]}, {missing}))
+            git = GitEvidence(root / "cache", REPOS[0], 1)
+            git.url = str(root / "no-such-remote")
+            with self.assertRaisesRegex(DataError, "Could not fetch evidence"):
+                git.prepare([missing])
 
     def test_changing_outcome_version_keeps_classification_and_old_result(self):
         pull = {"repo": REPOS[0], "number": 1, "merge": "revision"}

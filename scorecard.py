@@ -11,7 +11,7 @@ from pathlib import Path
 from string import Template
 from subprocess import TimeoutExpired
 
-from archive import DEFAULT_ARCHIVE, Archive, ArchivedGitHub
+from archive import DEFAULT_ARCHIVE, Archive
 from assessment import ASSESSMENT_VERSION, DEFAULT_REASONING_EFFORT, KINDS, OUTCOMES, REASONING_EFFORTS, Copilot, assess
 from github_data import DataError, GitHub
 from prepared import Evidence, digest, prepare
@@ -342,15 +342,15 @@ def capture_data(args, parser):
                 log(f"{repo}: {added} new PRs archived")
             if args.with_evidence:
                 total_prepared = 0
+                git_root = args.archive.parent / "git"
                 for repo in REPOS:
                     count = 0
-                    evidence = ArchivedGitHub(archive, github, repo, args.archive.parent / "git")
                     for pull in archive.pulls(repo, args.start, through):
                         if not pull["threads"] or archive.get_prepared(pull) is not None:
                             continue
                         if args.max_evidence_prs is not None and total_prepared >= args.max_evidence_prs:
                             break
-                        bundle = prepare(pull, Evidence(evidence, pull))
+                        bundle = prepare(pull, Evidence(git_root, pull))
                         archive.put_prepared(repo, pull["number"], bundle)
                         count += 1
                         total_prepared += 1

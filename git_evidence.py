@@ -1,16 +1,15 @@
 import os
 import re
-import subprocess
 from functools import lru_cache
 
-from github_data import run_command
+from github_data import DataError, run_command
 
 
 def object_id(value):
     return value if isinstance(value, str) and re.fullmatch("[0-9a-f]{40}", value) else None
 
 
-class GitUnavailable(RuntimeError):
+class GitUnavailable(DataError):
     pass
 
 
@@ -31,12 +30,10 @@ class GitEvidence:
             env["GIT_NO_LAZY_FETCH"] = "1"
         command = ["git", "--no-pager", "--literal-pathspecs", "-c", "core.quotePath=false",
                    "--git-dir", str(self.path), *args]
-        try:
-            result = run_command(command, binary=binary, env=env)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise GitUnavailable(f"Git {args[0]} could not run: {error.__class__.__name__}") from error
+        result = run_command(command, binary=binary, env=env)
         if result.returncode:
-            raise GitUnavailable(f"Git {args[0]} could not read the requested evidence")
+            error = result.stderr.decode("utf-8", errors="replace") if binary else result.stderr
+            raise GitUnavailable(f"Git {args[0]} failed: {error.strip()}")
         return result.stdout
 
     def prepare(self, revisions):
@@ -78,7 +75,10 @@ class GitEvidence:
                 except GitUnavailable:
                     try:
                         fetch([f"+{revision}:refs/scorecard/commits/{revision}"])
-                    except GitUnavailable:
+                    except GitUnavailable as error:
+                        # GitHub reports a commit it no longer has this way; anything else is a fetch failure.
+                        if "not our ref" not in str(error):
+                            raise DataError(f"Could not fetch evidence from {self.url}: {error}") from error
                         self.unavailable.add(revision)
         self.checked.update(set(missing) - self.unavailable)
 
@@ -100,7 +100,7 @@ class GitEvidence:
         statuses = {"A": "added", "D": "removed", "M": "modified", "T": "modified"}
         files = [{"filename": path, "status": statuses.get(kind, "modified")}
                  for kind, path in zip(changes[::2], changes[1::2])]
-        return {"git_range": (start, end), "files": files, "files_complete": True}
+        return {"git_range": (start, end), "files": files}
 
     def commit(self, revision):
         return self.files(self.parent(revision), revision)
@@ -113,7 +113,7 @@ class GitEvidence:
                   else "behind" if base == end else "diverged")
         item = self.files(base, end)
         entries = self.git("log", "--reverse", "--topo-order", "--format=%H %cI", f"{start}..{end}").splitlines()
-        return dict(item, status=status, total_commits=len(entries), commits=[
+        return dict(item, status=status, commits=[
             {"sha": revision, "commit": {"committer": {"date": timestamp}}}
             for revision, timestamp in (line.split(" ", 1) for line in entries)
         ])
