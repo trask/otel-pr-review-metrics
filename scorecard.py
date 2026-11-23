@@ -184,7 +184,6 @@ class Cohort:
     name: str
     dates: tuple[date, date]
     repos: dict
-    note: str = ""
 
     @property
     def total(self):
@@ -201,10 +200,10 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=
         stats = window.total
         counted = sum(stats.threads.values())
         assessed = counted - sum(stats.pending.values())
-        note = window.note or f"{assessed:,} of {counted:,} visible thread openers assessed."
-        if not window.note and stats.missing:
+        note = f"{assessed:,} of {counted:,} visible thread openers assessed."
+        if stats.missing:
             note += " This window includes days that capture has not finalized."
-        if not window.note and stats.unknown_roots:
+        if stats.unknown_roots:
             note += " GitHub did not return some thread openers."
         overview.append(f'<article class="window"><h2>{escape(window.name)}</h2>'
                         f'<p class="dates">{window.dates[0]} to {window.dates[1]} UTC</p>'
@@ -335,7 +334,7 @@ def capture_data(args, parser):
     github = GitHub(args.max_rate_wait)
     try:
         with closing(Archive(args.archive)) as archive:
-            shared = load_shared(archive) if args.shared or args.publish_data else None
+            shared = load_shared(archive) if args.publish_data else None
             for repo in REPOS:
                 log(f"Capturing {repo}")
                 added = archive.capture(github, repo, args.start, through, today)
@@ -424,7 +423,6 @@ def main(argv=None):
     capture.add_argument("--publish-data", action="store_true",
                          help="load and publish captured inputs on the public data branch")
     capture.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
-    capture.add_argument("--shared", action="store_true", help="seed the local archive from the data branch")
 
     for command in (assessment, report):
         command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None)

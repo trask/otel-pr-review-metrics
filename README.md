@@ -19,7 +19,7 @@ The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outsi
 python scorecard.py capture --with-evidence --publish-data
 ```
 
-`--shared` loads the branch before capture without pushing. `capture --publish-data` loads it and pushes updated inputs as a new commit. It leaves existing shared assessments in place without publishing new ones. Local Git repositories and API response caches stay off the branch. If another run updates `data` before the push, rerun to load its latest snapshot.
+`capture --publish-data` loads the branch and pushes updated inputs as a new commit. It leaves existing shared assessments in place without publishing new ones. Local Git repositories stay off the branch. If another run updates `data` before the push, rerun to load its latest snapshot.
 
 `capture --with-evidence` fetches the reviewed, head and merge commits into local Git repositories. GitHub still serves reviewed commits that a force push replaced. It saves patches and file snapshots for the commented path and up to three related changed paths per thread. The bundle records which evidence was unavailable or limited, including commits GitHub no longer has. Other fetch failures stop capture. Use `--max-evidence-prs 25` to prepare a batch and resume on the next run. Capture makes no model calls.
 

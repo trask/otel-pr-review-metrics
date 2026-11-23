@@ -98,7 +98,7 @@ class GitEvidence:
         changes = self.git("diff", "--no-ext-diff", "--no-renames", "--name-status", "-z",
                            start, end, "--").rstrip("\0").split("\0")
         statuses = {"A": "added", "D": "removed", "M": "modified", "T": "modified"}
-        files = [{"filename": path, "status": statuses.get(kind, "modified")}
+        files = [{"path": path, "status": statuses.get(kind, "modified")}
                  for kind, path in zip(changes[::2], changes[1::2])]
         return {"git_range": (start, end), "files": files}
 
@@ -113,10 +113,7 @@ class GitEvidence:
                   else "behind" if base == end else "diverged")
         item = self.files(base, end)
         entries = self.git("log", "--reverse", "--topo-order", "--format=%H %cI", f"{start}..{end}").splitlines()
-        return dict(item, status=status, commits=[
-            {"sha": revision, "commit": {"committer": {"date": timestamp}}}
-            for revision, timestamp in (line.split(" ", 1) for line in entries)
-        ])
+        return dict(item, status=status, commits=[tuple(line.split(" ", 1)) for line in entries])
 
     def patch(self, start, end, path):
         return self.git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",

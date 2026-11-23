@@ -31,7 +31,7 @@ URL_AUTH = re.compile(rb"""https?://[^\s:/"\\@]+:([^\s/"\\@]+)@""")
 PLACEHOLDER = re.compile(rb"(?i)(?:pass(?:word)?|token|secret|xxx+|\$\{?[\w.-]+\}?|\*+)")
 
 
-def safe_payload(payload):
+def safe_payload(value):
     def strings(value):
         if isinstance(value, str):
             yield value.encode("utf-8")
@@ -47,7 +47,7 @@ def safe_payload(payload):
             PLACEHOLDER.fullmatch(match.group(1)) for match in URL_AUTH.finditer(text)
         )
 
-    return all(map(safe, strings(decode(payload))))
+    return all(map(safe, strings(value)))
 
 
 def judgment_key(model, inputs, reasoning_effort):
@@ -248,13 +248,13 @@ class SharedData:
                 if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or number < 1:
                     raise DataError("Invalid local PR identity")
                 name = self.pull_file(repo, day, number)
-                yield name, self.text_record(pull), raw
+                yield name, self.text_record(pull), pull
                 if bundle and input_digest == digest(pull):
                     evidence = decode(bundle)
                     data = json_bytes(evidence)
                     if len(data) > MAX_RECORD_BYTES:
                         raise DataError(f"Prepared evidence is too large for {repo}#{number}")
-                    yield name.removesuffix(".json") + ".evidence.json.gz", gzip.compress(data, mtime=0), bundle
+                    yield name.removesuffix(".json") + ".evidence.json.gz", gzip.compress(data, mtime=0), evidence
                     if include_assessments and pull["threads"]:
                         yield from self.assessment_records(repo, number, name, pull, evidence)
 
@@ -271,7 +271,7 @@ class SharedData:
             if result.get("evidence_digest") != evidence_digest:
                 continue
             record = public_assessment(pull, result, key, bundle=evidence)
-            yield path, self.text_record(record), encode(record)
+            yield path, self.text_record(record), record
 
     def publish(self, *, include_assessments=False):
         if self.tip is None:
@@ -285,13 +285,13 @@ class SharedData:
         stream.extend(f"\nfrom {self.tip}\n".encode())
         seen = {path: value for path, value in self.imported.items()
                 if re.search(ASSESSMENT_FILE + "$", path)}
-        for path, blob, payload in self.local_records(include_assessments):
+        for path, blob, value in self.local_records(include_assessments):
             seen[path] = sha256(blob).digest()
             if len(blob) > MAX_RECORD_BYTES:
                 raise DataError(f"Shared record is too large: {path}")
             if seen[path] == self.imported.get(path):
                 continue
-            if payload is not None and not safe_payload(payload):
+            if value is not None and not safe_payload(value):
                 raise DataError(f"Shared publication withheld: {path} did not pass the public-data check.")
             stream.extend(f"M 100644 inline {path}\ndata {len(blob)}\n".encode())
             stream.extend(blob)

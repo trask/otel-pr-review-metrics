@@ -78,9 +78,9 @@ class Evidence:
                 return None
 
         return [
-            {"path": file["filename"], "previous_path": None, "status": file["status"],
-             "patch": patch(file["filename"])}
-            for file in item["files"] if file["filename"] in paths
+            {"path": file["path"], "previous_path": None, "status": file["status"],
+             "patch": patch(file["path"])}
+            for file in item["files"] if file["path"] in paths
         ]
 
     def changed_paths(self):
@@ -90,7 +90,7 @@ class Evidence:
         if self.head:
             for reviewed in sorted(revisions):
                 files += (self.compare(reviewed, self.head) or {}).get("files", [])
-        return {item["filename"] for item in files}
+        return {item["path"] for item in files}
 
     def for_thread(self, thread, paths):
         reviewed = object_id(thread["reviewed"])
@@ -104,10 +104,10 @@ class Evidence:
         if compared:
             complete = compared["status"] in {"ahead", "identical"}
             opened, merged = instant(thread["opened"]), instant(self.pull["merged"])
-            for item in compared["commits"]:
-                committed = instant(item["commit"]["committer"]["date"])
-                if opened < committed <= merged and object_id(item["sha"]):
-                    later_shas.append((item["sha"], item["commit"]["committer"]["date"]))
+            for sha, timestamp in compared["commits"]:
+                committed = instant(timestamp)
+                if opened < committed <= merged and object_id(sha):
+                    later_shas.append((sha, timestamp))
                 elif committed <= opened:
                     early_count += 1
                 elif committed > merged:

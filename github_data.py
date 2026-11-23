@@ -29,10 +29,6 @@ def instant(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def endpoint(path, **params):
-    return f"{path}?{urlencode(params)}" if params else path
-
-
 def pages(fetch, first):
     seen = set()
     connection = first
@@ -101,7 +97,7 @@ class GitHub:
             sleep(2 ** attempt)
 
     def get(self, path, **params):
-        return self._call("GET", endpoint(path, **params))
+        return self._call("GET", f"{path}?{urlencode(params)}" if params else path)
 
     def query(self, query, **variables):
         result = self._call("POST", "graphql", {"query": query, "variables": variables})
