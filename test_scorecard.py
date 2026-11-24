@@ -152,8 +152,8 @@ class CollectionTests(unittest.TestCase):
             root = Path(work)
             repo_path, remote = shared_remote(root)
 
-            def shared(archive, repos):
-                return SharedData(archive, repos, remote=str(remote), cwd=repo_path)
+            def shared(archive, repos, **options):
+                return SharedData(archive, repos, remote=str(remote), cwd=repo_path, **options)
 
             local, fresh, html = (root / name for name in ("local.sqlite3", "fresh.sqlite3", "scorecard.html"))
             with closing(Archive(local)) as writer:
@@ -219,13 +219,14 @@ class CollectionTests(unittest.TestCase):
                 retrieval_key = judgment_key(model, [RETRIEVAL_VERSION, pull, digest(bundle)], "high")
                 retrieval = dict(result, assessment_version=RETRIEVAL_VERSION, input_digest=retrieval_key,
                                  threads=[dict(result["threads"][0], status="unaddressed"), result["threads"][1]])
-                record = public_assessment(pull, retrieval, retrieval_key, bundle=bundle)
-                with reader.db:
-                    publisher.load_record(
-                        f"{repo}/2026-10/1.assessment.{retrieval_key}.json", publisher.text_record(record),
-                    )
 
-            with patch.object(Copilot, "ask", side_effect=AssertionError("no model calls")):
+            with closing(Archive(local)) as writer:
+                writer.put_judgment(repo, 1, "complete", retrieval_key, retrieval)
+            with (patch("scorecard.SharedData", side_effect=shared),
+                  patch.object(Copilot, "ask", side_effect=AssertionError("no model calls"))):
+                self.assertEqual(main(["assess", "--archive", str(local), "--retrieve-evidence",
+                                       "--publish-data", "--max-prs", "0", *options]), 0)
+                self.assertEqual(main(["load-data", "--archive", str(fresh)]), 0)
                 self.assertEqual(main(["report", "--archive", str(fresh), "--output", str(html)]), 0)
             text = html.read_text(encoding="utf-8")
             row = re.search(r'<th scope="row">semantic-conventions-genai.*?</tr>', text)[0]
@@ -773,7 +774,7 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in model.ask.call_args_list],
                          [CLASSIFY, JUDGE, JUDGE, JUDGE, LOOKUP_JUDGE, LOOKUP_JUDGE])
 
-    def test_local_retrieval_result_is_never_selected_for_publication(self):
+    def test_retrieval_result_is_not_selected_for_default_publication(self):
         pull = {"repo": REPOS[0], "number": 1}
         bundle = {"records": []}
         with TemporaryDirectory() as work, closing(Archive(Path(work) / "archive.sqlite3")) as archive:
@@ -784,6 +785,37 @@ class AssessmentTests(unittest.TestCase):
             shared = SharedData(archive, REPOS)
             shared.imported = {}
             self.assertEqual(list(shared.assessment_records(pull["repo"], 1, "1.json", pull, bundle)), [])
+
+    def test_retrieval_publication_replays_citations_without_publishing_transcript(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            _, pull, thread, evidence, _ = next(pilot_cases(root))
+            retrieval = OutcomeEvidence(root, pull)
+            retrieval.source = evidence
+            request = {"action": "read", "path": "adult.py", "query": "is_adult"}
+            link = f"https://github.com/{pull['repo']}/blob/{pull['merge']}/adult.py"
+            bundle = {"records": [], "threads": {thread["id"]: {"records": {}}}}
+            model, effort = "test-model", "high"
+            key = judgment_key(model, [RETRIEVAL_VERSION, pull, digest(bundle)], effort)
+            row = {
+                "id": thread["id"], "kind": "bug", "status": "addressed", "evidence": [link],
+                "first_pass": {"status": "unclear"}, "outcome_reason": "Local explanation",
+                "lookups": [{"request": request, "records": ["reviewed-lookup-0", "merged-lookup-0"]}],
+            }
+            result = {"assessment_version": RETRIEVAL_VERSION, "model": model, "reasoning_effort": effort,
+                      "evidence_digest": digest(bundle), "threads": [row]}
+            with closing(Archive(root / "archive.sqlite3")) as archive:
+                shared = SharedData(archive, REPOS, retrieval_git_root=root)
+                archive.put_judgment(pull["repo"], 1, "complete", key, result)
+                with patch("shared_data.OutcomeEvidence", return_value=retrieval):
+                    [(_, _, record)] = shared.assessment_records(pull["repo"], 1, "1.json", pull, bundle)
+                self.assertEqual(record["threads"], [
+                    {"id": thread["id"], "kind": "bug", "status": "addressed", "evidence": [link]},
+                ])
+                for records in (["reviewed-lookup-0"], ["merged-lookup-1"]):
+                    row["lookups"][0]["records"] = records
+                    with self.assertRaises(DataError):
+                        public_assessment(pull, result, key, bundle=bundle, lookup=retrieval.lookup)
 
     @unittest.skipIf(sys.version_info < (3, 11), "SDK requires Python 3.11")
     def test_sdk_reuses_client_but_replaces_prompt_in_each_tool_free_session(self):

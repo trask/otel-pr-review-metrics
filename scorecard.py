@@ -388,8 +388,8 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def load_shared(archive):
-    shared = SharedData(archive, REPOS)
+def load_shared(archive, *, retrieval_git_root=None):
+    shared = SharedData(archive, REPOS, retrieval_git_root=retrieval_git_root)
     shared.load()
     log(f"Loaded shared data from {shared.tip[:12]}")
     return shared
@@ -558,8 +558,8 @@ def build_report(args, parser):
     if assessing:
         args.audit_dir = args.audit_dir or args.archive.parent / "audit"
         if args.retrieve_evidence:
-            if args.publish_data:
-                parser.error("--retrieve-evidence is local only and cannot be used with --publish-data")
+            if args.publish_data and args.max_prs != 0:
+                parser.error("--retrieve-evidence with --publish-data requires --max-prs 0")
             args.assessment_version = RETRIEVAL_VERSION
     if args.custom_reviewer & (args.other_bot | COPILOT):
         parser.error("a custom reviewer login cannot also be another bot or GitHub Copilot")
@@ -583,7 +583,8 @@ def build_report(args, parser):
             raise DataError("Archive does not exist. Run `python scorecard.py load-data` or `capture` first.")
         with closing(Archive(args.archive, readonly=not assessing)) as archive, \
                 closing(Copilot(args.model, args.reasoning_effort)) as model:
-            shared = load_shared(archive) if publish else None
+            git_root = args.archive.parent / "git" if publish and args.retrieve_evidence else None
+            shared = load_shared(archive, retrieval_git_root=git_root) if publish else None
             cohorts, failures = collect(archive, args, model, windows, repos, shared)
             if shared is not None:
                 publish_shared(shared, include_assessments=True)
@@ -635,13 +636,13 @@ def main(argv=None):
         command.add_argument("--output", type=Path, default=Path(".scorecard", "scorecard.html"))
     assessment.set_defaults(assessment_version=ASSESSMENT_VERSION)
     assessment.add_argument("--publish-data", action="store_true",
-                            help="publish prepared-evidence-only assessments, not used by the default report")
+                            help="publish assessments (with --retrieve-evidence, requires --max-prs 0)")
     assessment.add_argument("--audit-dir", type=Path)
     assessment.add_argument("--max-prs", type=int, help="limit new assessments to this many PRs")
     assessment.add_argument("--prioritize-oversized", action="store_true",
                             help="assess PRs that need classification batches first in each window")
     assessment.add_argument("--retrieve-evidence", action="store_true",
-                            help="retry unclear outcomes with bounded read-only Git lookups (local only)")
+                            help="retry unclear outcomes with bounded read-only Git lookups")
     report.add_argument("--assessment-version", default=RETRIEVAL_VERSION, help=argparse.SUPPRESS)
     report.add_argument("--repo", action="append", choices=REPOS, metavar="OWNER/NAME",
                         help="include only this repository (repeat to include more)")

@@ -7,9 +7,11 @@ from io import BytesIO
 from uuid import uuid4
 
 from archive import decode, encode
-from assessment import CHANGE_TIMINGS, KINDS, LOCAL_ASSESSMENT_VERSIONS, OUTCOMES, REASONING_EFFORTS
+from assessment import (CHANGE_TIMINGS, KINDS, LOCAL_ASSESSMENT_VERSIONS, OUTCOMES, REASONING_EFFORTS,
+                        RETRIEVAL_VERSION)
 from github_data import DataError, instant, line_counts, merge_timing, run_command
 from git_evidence import object_id
+from outcome_evidence import LOOKUP_ROUNDS, OutcomeEvidence, valid_request
 from prepared import SUPPORTED_PREPARED_VERSIONS, digest, json_bytes
 
 
@@ -55,7 +57,32 @@ def judgment_key(model, inputs, reasoning_effort):
     return sha256(json.dumps([model, reasoning_effort, inputs], sort_keys=True).encode()).hexdigest()
 
 
-def public_assessment(pull, result, key, *, bundle=None):
+def _replay_citations(thread, row, lookup):
+    first = row.get("first_pass")
+    lookups = row.get("lookups")
+    if (not isinstance(first, dict) or first.get("status") != "unclear"
+            or not isinstance(lookups, list) or not 1 <= len(lookups) <= LOOKUP_ROUNDS):
+        return set()
+    urls = set()
+    for i, entry in enumerate(lookups):
+        if not isinstance(entry, dict):
+            return set()
+        ids = entry.get("records")
+        if not isinstance(ids, list) or any(not isinstance(ident, str) for ident in ids):
+            return set()
+        if not ids:
+            continue
+        request = entry.get("request")
+        if not valid_request(request):
+            return set()
+        records, _ = lookup(thread, request, str(i))
+        if not set(ids) <= records.keys():
+            return set()
+        urls.update(records[ident]["url"] for ident in ids)
+    return urls
+
+
+def public_assessment(pull, result, key, *, bundle=None, lookup=None):
     def invalid():
         raise DataError(f"Invalid shared assessment for {pull['repo']}#{pull['number']}")
 
@@ -108,7 +135,9 @@ def public_assessment(pull, result, key, *, bundle=None):
             if bundle is not None:
                 refs = bundle["threads"][thread["id"]]["records"]
                 allowed = {bundle["records"][index]["url"] for index in refs.values()}
-                if not set(links) <= allowed:
+                extra = set(links) - allowed
+                if extra and (version != RETRIEVAL_VERSION or lookup is None
+                              or not extra <= _replay_citations(thread, row, lookup)):
                     invalid()
             decision["evidence"] = links
         decisions.append(decision)
@@ -117,11 +146,12 @@ def public_assessment(pull, result, key, *, bundle=None):
 
 
 class SharedData:
-    def __init__(self, archive, repositories, *, remote=SHARED_REMOTE, cwd=None):
+    def __init__(self, archive, repositories, *, remote=SHARED_REMOTE, cwd=None, retrieval_git_root=None):
         self.archive = archive
         self.repositories = set(repositories)
         self.remote = remote
         self.cwd = cwd
+        self.retrieval_git_root = retrieval_git_root
         self.tip = None
         self.imported = {}
 
@@ -308,6 +338,14 @@ class SharedData:
 
     def assessment_records(self, repo, number, name, pull, evidence):
         evidence_digest = digest(evidence)
+        retriever = None
+
+        def replay(thread, request, suffix):
+            nonlocal retriever
+            if retriever is None:
+                retriever = OutcomeEvidence(self.retrieval_git_root, pull)
+            return retriever.lookup(thread, request, suffix)
+
         for key, payload in self.archive.db.execute("""
             SELECT fingerprint, payload FROM judgments
             WHERE repo = ? AND number = ? AND stage = 'complete' ORDER BY fingerprint
@@ -316,10 +354,15 @@ class SharedData:
             if path in self.imported:
                 continue
             result = decode(payload)
-            if (result.get("assessment_version") in LOCAL_ASSESSMENT_VERSIONS
-                    or result.get("evidence_digest") != evidence_digest):
+            if result.get("evidence_digest") != evidence_digest:
                 continue
-            record = public_assessment(pull, result, key, bundle=evidence)
+            version = result.get("assessment_version")
+            lookup = None
+            if version in LOCAL_ASSESSMENT_VERSIONS:
+                if version != RETRIEVAL_VERSION or self.retrieval_git_root is None:
+                    continue
+                lookup = replay
+            record = public_assessment(pull, result, key, bundle=evidence, lookup=lookup)
             yield path, self.text_record(record), record
 
     def publish(self, *, include_assessments=False):

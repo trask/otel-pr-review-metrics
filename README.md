@@ -67,7 +67,13 @@ Set `COPILOT_GITHUB_TOKEN` to a token with Copilot access. The runner also accep
 python scorecard.py assess --retrieve-evidence --window START END --custom-reviewer 'your-reviewer[bot]'
 ```
 
-Only `Unclear` outcomes can trigger a retry with read-only Git lookups. The default report reads these results from the same local archive. They do not publish automatically: `--publish-data` only supports assessments made without Git lookups, which the default report does not use. Sharing follow-up findings requires a separate review and publication step.
+Only `Unclear` outcomes can trigger a retry with read-only Git lookups. The default report reads these results from the archive. They do not publish automatically. After reviewing the results, publish saved decisions without calling Copilot:
+
+```sh
+python scorecard.py assess --retrieve-evidence --publish-data --max-prs 0
+```
+
+The exporter replays Git lookups to verify citations outside the prepared evidence. Published decisions contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. Model explanations and lookup transcripts stay local.
 
 ## How the agent makes its calls
 
