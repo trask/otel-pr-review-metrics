@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from collections import defaultdict
@@ -31,7 +32,7 @@ State the condition, required behavior, and any material exception in one short 
 A reviewer must be able to check each rule in a checkout with no PR or diff.
 Do not write generic advice, workflow instructions, or rules specific to one historical fix.
 Documented contracts and independently supported patterns are stronger than isolated
-preferences. Use a single case only if it reveals a concrete contract or failure mode.
+preferences. A single case can suggest a candidate, but it does not establish a rule.
 """
 DISCOVER = RULE_SCHEMA + """
 Draft up to 20 candidate rules for this repository. Read the review text together with the
@@ -40,14 +41,33 @@ If current code or documentation supersedes a finding, do not generalize it.
 Consider the supplied current code and repository guides even for areas with no reviews.
 """
 FINALIZE = RULE_SCHEMA + """
-Create the complete replacement rule set, not a supplement. Consolidate equivalent rules
-even when the drafts phrase them differently. Keep them scoped to where they are true.
-The prior instructions are provided only as reference material to catch missed rules.
-Do not preserve their layout, paths, or wording. Include a rule from them only if current
-repository evidence or a reviewed/merged example also supports it. Check each prior rule
-for supported constraints that discovery missed, especially prohibitions and exceptions.
-Every rule needs at least one source that is not a prior Copilot instruction. Omit
-unsupported claims.
+Create a short replacement rule set, not a supplement. Prefer fewer than 20 strong rules
+over comprehensive coverage. Combine equivalent rules and use the narrowest justified
+scope. Prior Copilot instructions can suggest missed rules but are not evidence.
+
+Promote a rule only if it is worth flagging in another in-scope file today and one of
+these holds:
+- A current repository guide explicitly states the same contract. Copy one short,
+  contiguous, verbatim quote from that guide. A description of how code happens to
+  work is not a contract, and a related guide is not evidence for a new requirement.
+  The quote must support the rule's scope and all of its requirements. A contract
+  for one language or domain does not establish a rule for another. Do not turn
+  an optional feature into a requirement.
+- At least two distinct PRs independently exhibit the same failure or enforce the
+  same convention. Comments on one PR, or follow-ups to the same fix, count once.
+
+Keep documented exceptions. Drop one-off regression details, existing wiring,
+particular fixture values, and choices that belong in a regression test instead.
+Express the behavior that must hold, not an exhaustive list of the current
+directories, exclusions, cache keys, or helpers used to implement it.
+If generalizing a candidate makes it vague or unsupported, omit it.
+
+Each final rule object must also include "audit_example": a one-sentence concrete
+violation in a different plausible in-scope file or component than the original
+finding, with its consequence. Do not frame it as a PR or restate the rule.
+Include "contract": {"source":"D1","quote":"verbatim text from the guide"} for
+guide-backed rules, or "contract": null for rules backed by independent PRs.
+The cited guide ID must be in "sources". Do not fabricate a quote.
 """
 
 
@@ -247,13 +267,16 @@ def repository_sources(snapshot, repo, examples):
     return sources
 
 
-def validate_rules(value, scopes, sources):
+def validate_rules(value, scopes, sources, *, final=False):
     if not isinstance(value, list):
         raise DataError("The rules draft must be a JSON array")
     result = []
+    fields = {"scopes", "rule", "sources"}
+    if final:
+        fields |= {"audit_example", "contract"}
     for number, row in enumerate(value, 1):
-        if not isinstance(row, dict) or row.keys() != {"scopes", "rule", "sources"}:
-            raise DataError(f"Rule {number} does not have scopes, rule, and sources fields")
+        if not isinstance(row, dict) or row.keys() != fields:
+            raise DataError(f"Rule {number} must contain exactly these fields: {', '.join(sorted(fields))}")
         paths, rule, refs = row["scopes"], row["rule"], row["sources"]
         if not isinstance(rule, str) or not rule.strip() or len(rule) > 720 or "\0" in rule:
             raise DataError(f"Rule {number} must be a short nonempty paragraph of at most 720 characters")
@@ -265,21 +288,46 @@ def validate_rules(value, scopes, sources):
         if (not isinstance(refs, list) or not refs
                 or not all(isinstance(ref, str) and ref in sources for ref in refs)):
             raise DataError(f"Rule {number} must cite IDs from the supplied sources object")
-        if all(sources[ref]["kind"] == "prior" for ref in refs):
-            raise DataError(f"Rule {number} cites only prior instructions and lacks independent support")
-        result.append({"scopes": sorted(paths), "rule": " ".join(rule.split()), "sources": sorted(set(refs))})
+        row = dict(row, scopes=sorted(paths), rule=" ".join(rule.split()), sources=sorted(set(refs)))
+        if final:
+            reason = promotion_failure(row, sources)
+            if reason:
+                logging.warning("Omitting draft rule %d: %s", number, reason)
+                continue
+        result.append(row)
     if not safe_payload(result):
         raise DataError("The rules draft failed the public-data check")
     return result
 
 
-def ask_rules(model, prompt, data):
+def promotion_failure(row, sources):
+    example = row["audit_example"]
+    if not isinstance(example, str) or not example.strip() or len(example) > 500 or "\0" in example:
+        return "missing a concrete checkout audit example"
+    refs = row["sources"]
+    contract = row["contract"]
+    if contract is None:
+        pulls = {sources[ref]["pr"] for ref in refs if sources[ref]["kind"] == "review"}
+        return None if len(pulls) >= 2 else "needs a current guide quote or review evidence from at least two PRs"
+    if not isinstance(contract, dict) or contract.keys() != {"source", "quote"}:
+        return "invalid guide citation"
+    ref, quote = contract["source"], contract["quote"]
+    if not isinstance(ref, str) or ref not in refs or sources[ref]["kind"] != "guide":
+        return "contract must cite a current repository guide, not a prior Copilot instruction"
+    if not isinstance(quote, str) or not quote.strip() or len(quote) > 500:
+        return "missing a short guide quote"
+    if " ".join(quote.split()) not in " ".join(sources[ref]["text"].split()):
+        return "contract quote does not appear verbatim in the cited guide excerpt"
+    return None
+
+
+def ask_rules(model, prompt, data, *, final=False):
     value = model.ask(prompt, data)
     try:
-        return validate_rules(value, data["scopes"], data["sources"])
+        return validate_rules(value, data["scopes"], data["sources"], final=final)
     except DataError as error:
         correction = f"\nThe previous draft was invalid: {error}. Return a complete corrected draft."
-    return validate_rules(model.ask(prompt + correction, data), data["scopes"], data["sources"])
+    return validate_rules(model.ask(prompt + correction, data), data["scopes"], data["sources"], final=final)
 
 
 def discover_rules(model, scopes, sources):
@@ -333,11 +381,11 @@ def draft_rules(model, snapshot, repo, examples):
             summary[key] = {k: v for k, v in source.items() if k != "urls"}
         elif key in cited:
             summary[key] = {"kind": "review", "path": source["path"], "pr": source["pr"],
-                            "review": bounded(source["review"], 160)}
+                            "review": bounded(source["review"], 300)}
     data = {"scopes": scopes, "candidates": candidates, "sources": summary}
     if input_size(FINALIZE, data) > MAX_INPUT:
         raise DataError("Rule consolidation exceeds the model input budget; narrow the review window")
-    return merge_identical(ask_rules(model, FINALIZE, data)), sources
+    return merge_identical(ask_rules(model, FINALIZE, data, final=True)), sources
 
 
 def render_rules(rules, sources):
@@ -355,7 +403,10 @@ def render_rules(rules, sources):
         else:
             path = ROOT_INSTRUCTIONS
         groups[scopes].append((path, row["rule"]))
-        evidence.append(dict(row, id=key, file=path, sources=[
+        contract = row["contract"]
+        if contract is not None:
+            contract = {"quote": contract["quote"], "url": sources[contract["source"]]["urls"][0]}
+        evidence.append(dict(row, id=key, file=path, contract=contract, sources=[
             {field: sources[ref][field] for field in ("kind", "path", "urls")} for ref in row["sources"]
         ]))
     files = {ROOT_INSTRUCTIONS: POLICY}

@@ -18,7 +18,7 @@ from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from outcome_evidence import OutcomeEvidence
 from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
-from review_instructions import DISCOVER, FINALIZE, Snapshot, archived_examples, draft_rules, render_rules
+from review_instructions import DISCOVER, FINALIZE, Snapshot, archived_examples, draft_rules, render_rules, validate_rules
 from scorecard import AUTOMATED, BASELINE, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -969,10 +969,11 @@ class InstructionDraftTests(unittest.TestCase):
                 shared = next(row for row in data["sources"].values() if row["path"] == "AGENTS.md")
                 self.assertIn("without declaring expectations", shared["text"])
                 if prompt == FINALIZE:
-                    prior = next(key for key, row in data["sources"].items() if row["kind"] == "prior")
-                    return [dict(rule, sources=[prior])]
-                self.assertIn("lacks independent support", prompt)
-                return [rule, rule]
+                    return [rule]
+                self.assertIn("audit_example", prompt)
+                promoted = dict(rule, audit_example="A YAML check presents a rejected value as missing.",
+                                contract={"source": "D1", "quote": originals["README.md"].strip()})
+                return [promoted, promoted]
 
             model = Mock()
             model.ask.side_effect = answer
@@ -983,6 +984,7 @@ class InstructionDraftTests(unittest.TestCase):
             self.assertEqual(git_at(repo, "status", "--short"), "")
             self.assertEqual(removed, [".github/instructions/old/nested.instructions.md"])
             self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["contract"]["quote"], originals["README.md"].strip())
             patch_file = root / "draft.patch"
             patch_file.write_bytes(patch_bytes)
             git_at(repo, "apply", str(patch_file))
@@ -994,6 +996,31 @@ class InstructionDraftTests(unittest.TestCase):
             for path in ("AGENTS.md", ".github/instructions/notes.md", "README.md", "tools/runner/runner.py"):
                 self.assertEqual((repo / path).read_text(encoding="utf-8"), originals[path])
             self.assertEqual(model.ask.call_count, 3)
+
+    def test_promotion_requires_a_current_contract_or_more_than_one_pr(self):
+        sources = {
+            "D1": {"kind": "guide", "text": "Shared scenarios have no\n instrumentation setup."},
+            "I1": {"kind": "prior", "text": "Shared scenarios have no instrumentation setup."},
+            "R1": {"kind": "review", "pr": 42},
+            "R2": {"kind": "review", "pr": 42},
+            "R3": {"kind": "review", "pr": 65},
+        }
+        rule = {"scopes": ["scenarios"], "rule": "Shared scenarios are instrumented externally.",
+                "audit_example": "A Redis workload starts a telemetry provider and reports its own spans."}
+        guide = dict(rule, sources=["D1"], contract={"source": "D1", "quote":
+                     "Shared scenarios have no instrumentation setup."})
+        independent = dict(rule, sources=["R1", "R3"], contract=None)
+        with self.assertLogs(level="WARNING") as logs:
+            promoted = validate_rules([
+                guide,
+                dict(guide, contract={"source": "D1", "quote": "Invented contract."}),
+                dict(guide, sources=["I1"], contract={"source": "I1", "quote": guide["contract"]["quote"]}),
+                dict(rule, sources=["D1", "R1", "R2"], contract=None),
+                independent,
+                dict(independent, audit_example=""),
+            ], ["scenarios"], sources, final=True)
+        self.assertEqual(promoted, [guide, independent])
+        self.assertEqual(len(logs.output), 4)
 
 
 class ReportTests(unittest.TestCase):
