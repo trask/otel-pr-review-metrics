@@ -1,6 +1,8 @@
 import os
+import re
 import sys
 import unittest
+from collections import Counter
 from contextlib import closing
 from datetime import date
 from pathlib import Path
@@ -184,13 +186,14 @@ class CollectionTests(unittest.TestCase):
                         (n, {"login": "person", "__typename": "User"}) for n in pending
                     ]
                     self.assertEqual(main(["capture-authors", "--archive", str(fresh), "--through", day]), 0)
-                self.assertEqual(main(["report", "--archive", str(fresh), *options]), 0)
-                self.assertIn("<td>1</td><td>1.00</td><td>0.0%</td><td>0.0%</td><td>0.00</td>",
-                              html.read_text(encoding="utf-8"))
-                self.assertEqual(main(["report", "--archive", str(fresh), "--reasoning-effort", "medium", *options]), 0)
-                self.assertIn("<td>1</td><td>1.00</td><td>0.0%</td><td>100.0%</td><td>0.00</td>",
-                              html.read_text(encoding="utf-8"))
-                self.assertIn("test-model (medium reasoning effort)", html.read_text(encoding="utf-8"))
+                for effort, unclear in (("high", "0.0%"), ("medium", "100.0%")):
+                    self.assertEqual(main(["report", "--archive", str(fresh), "--reasoning-effort", effort,
+                                           *options]), 0)
+                    text = html.read_text(encoding="utf-8")
+                    row = re.search(r'<th scope="row">semantic-conventions-genai</th><td>1</td>(.*?)</tr>', text)
+                    self.assertEqual(re.findall(r'class="rate-value">([^<]+)', row.group(1)),
+                                     ["1.00", "0.0%", unclear, "0.00"])
+                    self.assertIn(f"test-model ({effort} reasoning effort)", text)
 
             with closing(Archive(fresh)) as reader:
                 publisher = shared(reader, REPOS)
@@ -784,11 +787,32 @@ class ReportTests(unittest.TestCase):
                                    "--window", day, day]), 0)
             html = output.read_text(encoding="utf-8")
             self.assertIn("0 of 2 visible thread openers assessed. Excluded 3 bot-authored PRs.", html)
-            self.assertIn('<th scope="row">semantic-conventions-genai</th><td>2</td>', html)
-            self.assertRegex(html, r'<th scope="row">semantic-conventions-genai</th><td>2</td>'
+            self.assertRegex(html, r'<th scope="row">semantic-conventions-genai'
+                                   r'<small class="row-note">2 unassessed</small></th><td>2</td>'
                                    r'(?:<td class="missing" aria-label="Not measured" title="Not measured">'
-                                   r'&mdash;</td>){3}<td>0.00</td>')
-            self.assertNotIn("GitHub did not return some thread openers.", html)
+                                   r'&mdash;</td>){3}<td><span class="rate"><span class="rate-value">0\.00</span>'
+                                   r'<small class="rate-count">0 / 2</small>')
+            self.assertNotIn("missing thread openers</small>", html)
+
+    def test_selected_repositories_limit_report_scope(self):
+        day = BASELINE[0].isoformat()
+        with TemporaryDirectory() as work:
+            path, output = (Path(work) / name for name in ("archive.sqlite3", "scorecard.html"))
+            with closing(Archive(path)) as archive, archive.db:
+                archive.db.executemany("INSERT INTO complete_days VALUES (?, ?)",
+                                       ((repo, day) for repo in REPOS[:2]))
+                excluded = REPOS[2]
+                merged = f"{day}T12:00:00Z"
+                archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                   (excluded, 1, day, merged, encode({"repo": excluded, "number": 1})))
+            self.assertEqual(main(["report", "--archive", str(path), "--output", str(output),
+                                   "--window", day, day, "--repo", REPOS[0], "--repo", REPOS[1]]), 0)
+            html = output.read_text(encoding="utf-8")
+            self.assertIn("across 2 public repositories.", html)
+            for repo in REPOS[:2]:
+                self.assertIn(f'<th scope="row">{repo.split("/")[1]}</th>', html)
+            self.assertNotIn(excluded.split("/")[1], html)
+            self.assertNotIn("Capture is incomplete", html)
 
     def test_account_groups_include_bots_and_configured_users_without_merging_unknowns(self):
         self.assertEqual(identity({"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
@@ -833,21 +857,47 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(html.count('<th scope="col">Findings per merged PR</th><th scope="col">% unaddressed</th>'
                                     '<th scope="col">% unclear</th>'), 8)
         self.assertNotIn('<th scope="col" rowspan="2">Findings per merged PR</th>', html)
-        self.assertIn('<th scope="row">All repositories</th><td>4</td><td>0.75</td>'
-                      '<td>33.3%</td><td>33.3%</td><td>0.25</td><td>0.0%</td><td>0.0%</td>', html)
-        self.assertIn('<th scope="row">Bug</th><td>0.50</td><td>50.0%</td><td>0.0%</td><td>0.00</td>'
-                      '<td class="missing" aria-label="No denominator for this rate" '
-                      'title="No denominator for this rate">&mdash;</td>', html)
-        self.assertIn('<th scope="row">Improvement</th><td>0.25</td><td>0.0%</td>'
-                      '<td>100.0%</td><td>0.25</td><td>0.0%</td><td>0.0%</td>', html)
+        total_row = re.search(r'<th scope="row">All repositories</th><td>4</td>(.*?)</tr>', html).group(1)
+        self.assertEqual(re.findall(r'class="rate-value">([^<]+)', total_row),
+                         ["0.75", "33.3%", "33.3%", "0.25", "0.0%", "0.0%"])
+        self.assertIn('<span class="rate unaddressed" style="--rate: 33.3%"><span class="rate-value">33.3%</span>'
+                      '<small class="rate-count">1 / 3</small>', total_row)
+        self.assertIn('<span class="rate unclear">', total_row)
+        bug_row = re.search(r'<th scope="row">Bug</th>(.*?)</tr>', html).group(1)
+        self.assertIn('title="No denominator for this rate">&mdash;</td>', bug_row)
+        headline = html.split('<div class="headline">', 1)[1].split("</article>", 1)[0]
+        self.assertEqual(re.findall(r'class="rate-value">([^<]+)', headline), ["0.75", "33.3%", "0.25", "0.0%"])
         self.assertIn('title="Not measured">&mdash;</td>', html)
         self.assertNotIn("N/M", html)
         self.assertNotIn("N/A", html)
         self.assertNotIn("All inline review threads", html)
         self.assertIn("5 of 5 visible thread openers assessed.", html)
 
+    def test_incomplete_capture_shows_provisional_rates_except_for_unassessed_groups(self):
+        available = Stats(prs=2, missing=True,
+                          findings=Counter({("copilot", "bug", "unaddressed"): 1}))
+        unassessed = Stats(prs=3, pending=Counter(human=1))
+        html = render([Cohort("Baseline", BASELINE, {REPOS[0]: available, REPOS[1]: unassessed})], set(), "model")
+        self.assertIn("Counts and rates are provisional and use archived PRs only.", html)
+        self.assertIn("Rates that depend on unassessed or missing thread openers are not shown.", html)
+        self.assertRegex(html, r'semantic-conventions-genai<small class="row-note">Capture incomplete</small>'
+                               r'</th><td>2</td>.*?class="rate-value">0\.50</span>')
+        total_row = re.search(r'<th scope="row">All repositories(.*?)</tr>', html).group(1)
+        self.assertIn('<small class="row-note">Capture incomplete; 1 unassessed</small></th><td>5</td>', total_row)
+        self.assertEqual(re.findall(r'class="rate-value">([^<]+)', total_row), ["0.20", "100.0%", "0.0%"])
+        self.assertEqual(total_row.count('title="Not measured"'), 3)
+
+        unassessed.pending["copilot"] = 1
+        html = render([Cohort("Baseline", BASELINE, {REPOS[0]: available, REPOS[1]: unassessed})], set(), "model")
+        self.assertIn("Headline rates cover 1 of 2 repositories,", html)
+        headline = html.split('<div class="headline">', 1)[1].split("</article>", 1)[0]
+        self.assertEqual(re.findall(r'class="rate-value">([^<]+)', headline), ["0.50", "100.0%", "0.00"])
+        total_row = re.search(r'<th scope="row">All repositories(.*?)</tr>', html).group(1)
+        self.assertEqual(total_row.count('title="Not measured"'), 6)
+
     def test_scorecard_terms_group_and_define_the_selected_outcomes(self):
         html = render([], {"custom-reviewer"}, "model")
+        self.assertRegex(html, r"<details>\s*<summary>Scorecard terms and methodology</summary>")
         self.assertNotIn("<dt>Human</dt>", html)
         self.assertRegex(html, r"<dt>Bot</dt>\s*<dd>[^<]*opentelemetrybot automation account\.</dd>")
         self.assertRegex(html, r"<dt>Automated Finding</dt>\s*<dd>[^<]*GitHub Copilot[^<]*custom-reviewer\.</dd>")

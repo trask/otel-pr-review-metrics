@@ -34,9 +34,11 @@ python scorecard.py capture --with-evidence --publish-data
 python scorecard.py report --window 2026-10-15 2026-11-20
 ```
 
+Use `--repo OWNER/NAME` to include only that repository. Repeat `--repo` to include several. Without it, the report includes all four.
+
 The report excludes PRs opened by GitHub `Bot` actors, logins ending in `[bot]`, or `opentelemetrybot` (case-insensitive). It still counts other PRs, including those with no available author, those opened before the window, and those with no inline threads. Bot reviews on included PRs still count. Dates capture has not finalized are distinct from days with zero merges.
 
-For both Automated and Human findings, the report shows original findings per included merged PR and the percentages of findings that are unaddressed or unclear. Both percentages use all findings, as does the numerator for findings per PR. Each finding type uses the same merged PR denominator.
+For both Automated and Human findings, the report shows original findings per included merged PR and the percentages of findings that are unaddressed or unclear. Each rate shows its numerator and denominator. The percentages use all findings in the row, and each finding type uses the same merged PR denominator. If capture is incomplete, the report labels counts and rates from archived PRs as provisional. It withholds rates that depend on unassessed or missing thread openers. If neither reviewer group has a rate across all repositories, the headline can show rates for a labeled subset of repositories with complete assessments.
 
 To compare with a later window, supply the custom reviewer's exact GitHub login:
 

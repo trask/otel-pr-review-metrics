@@ -31,6 +31,7 @@ BASELINE = (date(2026, 10, 1), date(2026, 11, 15))
 COPILOT = {"copilot-pull-request-reviewer", "copilot-pull-request-reviewer[bot]"}
 BOT_PR_AUTHORS = {"opentelemetrybot"}
 AUTOMATED = ("copilot", "custom")
+FINDING_GROUPS = (("Automated", AUTOMATED), ("Human", ("human",)))
 NO_DENOMINATOR = object()
 TEMPLATE = Path(__file__).with_name("scorecard.html")
 COMMAND_ERRORS = (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError)
@@ -52,6 +53,17 @@ def identity(author, custom, outside):
 def is_bot_pr_author(login, kind):
     login = (login or "").lower()
     return kind == "Bot" or login.endswith("[bot]") or login in BOT_PR_AUTHORS
+
+
+@dataclass(frozen=True)
+class Rate:
+    numerator: int
+    denominator: int
+    outcome: str = ""
+
+    @property
+    def value(self):
+        return self.numerator / self.denominator
 
 
 @dataclass
@@ -87,11 +99,16 @@ class Stats:
             self.excluded_bot_prs + other.excluded_bot_prs,
         )
 
-    def measured(self, groups):
-        return not self.missing and not self.unknown_roots and not any(self.pending[g] for g in groups)
+    @property
+    def pr_count(self):
+        return None if self.missing and not self.prs else self.prs
+
+    @property
+    def unassessed(self):
+        return sum(self.pending[group] for _, groups in FINDING_GROUPS for group in groups)
 
     def finding(self, groups, status=None, kind=None):
-        if self.measured(groups):
+        if self.pr_count is not None and not self.unknown_roots and not any(self.pending[g] for g in groups):
             return sum(
                 n for (group, finding_kind, outcome), n in self.findings.items()
                 if group in groups and status in (None, outcome) and kind in (None, finding_kind)
@@ -102,25 +119,43 @@ class Stats:
         findings = self.finding(groups, kind=kind)
         if findings is None:
             return None
-        return f"{findings / self.prs:,.2f}" if self.prs else NO_DENOMINATOR
+        return Rate(findings, self.prs) if self.prs else NO_DENOMINATOR
 
     def outcome_pct(self, groups, status, kind=None):
         findings = self.finding(groups, kind=kind)
         if findings is None:
             return None
-        return f"{self.finding(groups, status, kind) / findings:.1%}" if findings else NO_DENOMINATOR
+        return Rate(self.finding(groups, status, kind), findings, status) if findings else NO_DENOMINATOR
+
+
+def missing_reason(value):
+    if value is None:
+        return "Not measured"
+    if value is NO_DENOMINATOR:
+        return "No denominator for this rate"
+    return None
+
+
+def rate_content(rate):
+    text = f"{rate.value:.1%}" if rate.outcome else f"{rate.value:,.2f}"
+    bar = f' style="--rate: {text}"' if rate.outcome == "unaddressed" else ""
+    css = f' {rate.outcome}' if rate.outcome else ""
+    return (f'<span class="rate{css}"{bar}><span class="rate-value">{text}</span>'
+            f'<small class="rate-count">{rate.numerator:,} / {rate.denominator:,}</small></span>')
 
 
 def cell(value):
-    if value is None or value is NO_DENOMINATOR:
-        reason = "Not measured" if value is None else "No denominator for this rate"
+    if reason := missing_reason(value):
         return f'<td class="missing" aria-label="{reason}" title="{reason}">&mdash;</td>'
+    if isinstance(value, Rate):
+        return f"<td>{rate_content(value)}</td>"
     text = f"{value:,}" if isinstance(value, int) else value
     return f"<td>{escape(text)}</td>"
 
 
-def row(label, values, css=""):
-    return (f'<tr class="{css}"><th scope="row">{escape(label)}</th>'
+def row(label, values, css="", note=""):
+    annotation = f'<small class="row-note">{escape(note)}</small>' if note else ""
+    return (f'<tr class="{css}"><th scope="row">{escape(label)}{annotation}</th>'
             + "".join(cell(value) for value in values) + "</tr>")
 
 
@@ -145,7 +180,7 @@ def findings_header(lead):
 
 def finding_rates(stats, kind=None):
     return [
-        value for groups in (AUTOMATED, ("human",))
+        value for _, groups in FINDING_GROUPS
         for value in (stats.findings_per_pr(groups, kind), stats.outcome_pct(groups, "unaddressed", kind),
                       stats.outcome_pct(groups, "unclear", kind))
     ]
@@ -153,11 +188,21 @@ def finding_rates(stats, kind=None):
 
 def main_table(label, repos, total):
     def values(stats):
-        return [None if stats.missing else stats.prs, *finding_rates(stats)]
+        return [stats.pr_count, *finding_rates(stats)]
 
-    body = "".join(row(repo.split("/")[1], values(stats)) for repo, stats in repos.items())
+    def note(stats):
+        parts = []
+        if stats.missing:
+            parts.append("Capture incomplete")
+        if pending := stats.unassessed:
+            parts.append(f"{pending:,} unassessed")
+        if stats.unknown_roots:
+            parts.append(f"{stats.unknown_roots:,} missing thread openers")
+        return "; ".join(parts)
+
+    body = "".join(row(repo.split("/")[1], values(stats), note=note(stats)) for repo, stats in repos.items())
     head = findings_header(["Repository", "Merged PRs"])
-    return table(label, head, body + row("All repositories", values(total), "total"))
+    return table(label, head, body + row("All repositories", values(total), "total", note(total)))
 
 
 def types_table(label, total):
@@ -180,6 +225,34 @@ class Cohort:
         return f"{self.name} | {self.dates[0]} to {self.dates[1]} UTC"
 
 
+def headline(stats):
+    def metric(label, value):
+        reason = missing_reason(value)
+        content = f'<span class="missing">{reason}</span>' if reason else rate_content(value)
+        return f"<div><dt>{label}</dt><dd>{content}</dd></div>"
+
+    groups = "".join(
+        f'<div class="headline-group"><h3>{name} findings</h3><dl>'
+        + metric("Findings per merged PR", stats.findings_per_pr(group))
+        + metric("% unaddressed", stats.outcome_pct(group, "unaddressed"))
+        + "</dl></div>"
+        for name, group in FINDING_GROUPS
+    )
+    return f'<div class="headline">{groups}</div>'
+
+
+def window_headline(window, total):
+    if any(total.findings_per_pr(groups) is not None for _, groups in FINDING_GROUPS):
+        return headline(total)
+    measured = [stats for stats in window.repos.values() if stats.prs and
+                all(stats.findings_per_pr(groups) is not None for _, groups in FINDING_GROUPS)]
+    if not measured:
+        return headline(total)
+    return (f'<p class="headline-scope">Headline rates cover {len(measured)} of {len(window.repos)} '
+            "repositories, using only those with archived PRs and complete assessments.</p>"
+            + headline(sum(measured, start=Stats())))
+
+
 def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=DEFAULT_REASONING_EFFORT):
     overview, main, types = [], [], []
     for window in cohorts:
@@ -189,20 +262,24 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=
         note = f"{assessed:,} of {counted:,} visible thread openers assessed."
         if stats.excluded_bot_prs:
             note += f" Excluded {stats.excluded_bot_prs:,} bot-authored PRs."
+        coverage = []
         if stats.missing:
-            note += " This window includes days that capture has not finalized."
-        if stats.unknown_roots:
-            note += " GitHub did not return some thread openers."
+            coverage.append("Capture is incomplete. Counts and rates are provisional and use archived PRs only.")
+        if stats.unknown_roots or stats.unassessed:
+            coverage.append("Rates that depend on unassessed or missing thread openers are not shown.")
+        coverage_note = f'<p class="coverage">{" ".join(coverage)}</p>' if coverage else ""
         overview.append(f'<article class="window"><h2>{escape(window.name)}</h2>'
                         f'<p class="dates">{window.dates[0]} to {window.dates[1]} UTC</p>'
-                        f"<p>{escape(note)}</p></article>")
+                        f"{coverage_note}{window_headline(window, stats)}<p>{escape(note)}</p></article>")
         main.append(main_table(window.label, window.repos, stats))
         types.append(types_table(window.label, stats))
     custom_reviewers = f" Configured: {', '.join(sorted(custom))}." if custom else ""
     legacy = version == digest("compact-sdk-v1") or version == (
         "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313")
+    repo_count = len({repo for window in cohorts for repo in window.repos})
     return Template(TEMPLATE.read_text(encoding="utf-8")).substitute(
         overview="".join(overview), main="".join(main), types="".join(types),
+        repositories=f"{repo_count} public {'repository' if repo_count == 1 else 'repositories'}",
         custom_reviewers=escape(custom_reviewers),
         addressed_definition=("A matching change was made after the review opened and survived at merge."
                               if legacy else "The issue is gone at merge."),
@@ -276,9 +353,9 @@ def publish_shared(shared, *, include_assessments=False):
     log(f"Published shared data as {commit[:12]}" if commit else "Shared data is already up to date")
 
 
-def assessment_order(archive, dates, prioritize_oversized):
+def assessment_order(archive, dates, prioritize_oversized, repos=REPOS):
     remaining = []
-    for repo in REPOS:
+    for repo in repos:
         for pull in archive.pulls(repo, *dates):
             if not prioritize_oversized:
                 yield pull, None
@@ -293,15 +370,15 @@ def assessment_order(archive, dates, prioritize_oversized):
         yield pull, None
 
 
-def collect(archive, args, model, windows, shared=None):
+def collect(archive, args, model, windows, repo_names, shared=None):
     cohorts, failures, runs = [], 0, 0
     completed = 0
     authors_by_window = [
-        {repo: archive.pull_authors(repo, *dates) for repo in REPOS} for _, dates in windows
+        {repo: archive.pull_authors(repo, *dates) for repo in repo_names} for _, dates in windows
     ]
     for (label, dates), authors in zip(windows, authors_by_window, strict=True):
-        repos = {repo: Stats(missing=bool(archive.pending_days(repo, *dates))) for repo in REPOS}
-        for pull, bundle in assessment_order(archive, dates, args.prioritize_oversized):
+        repos = {repo: Stats(missing=bool(archive.pending_days(repo, *dates))) for repo in repo_names}
+        for pull, bundle in assessment_order(archive, dates, args.prioritize_oversized, repo_names):
             repo, number = pull["repo"], pull["number"]
             author = authors[repo].get(number)
             if author is None:
@@ -441,6 +518,7 @@ def build_report(args, parser):
         if not args.custom_reviewer:
             parser.error("--follow-up requires --custom-reviewer LOGIN")
         windows.append(("Follow-up", (start, end)))
+    repos = tuple(repo for repo in REPOS if not args.repo or repo in args.repo)
     try:
         publish = assessing and args.publish_data
         if not args.archive.is_file() and not publish:
@@ -448,7 +526,7 @@ def build_report(args, parser):
         with closing(Archive(args.archive, readonly=not assessing)) as archive, \
                 closing(Copilot(args.model, args.reasoning_effort)) as model:
             shared = load_shared(archive) if publish else None
-            cohorts, failures = collect(archive, args, model, windows, shared)
+            cohorts, failures = collect(archive, args, model, windows, repos, shared)
             if shared is not None:
                 publish_shared(shared, include_assessments=True)
     except COMMAND_ERRORS as error:
@@ -485,7 +563,7 @@ def main(argv=None):
 
     for command in (assessment, report):
         command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None,
-                             prioritize_oversized=False, retrieve_evidence=False)
+                             prioritize_oversized=False, retrieve_evidence=False, repo=None)
         command.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                              default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
         command.add_argument("--follow-up", nargs=2, type=date.fromisoformat, metavar=("START", "END"))
@@ -503,6 +581,8 @@ def main(argv=None):
     assessment.add_argument("--retrieve-evidence", action="store_true",
                             help="retry unclear outcomes with bounded read-only Git lookups (local only)")
     report.add_argument("--assessment-version", help="full assessment_version from a saved audit file")
+    report.add_argument("--repo", action="append", choices=REPOS, metavar="OWNER/NAME",
+                        help="include only this repository (repeat to include more)")
 
     args = parser.parse_args(argv)
     return args.run(args, parser)
