@@ -90,6 +90,10 @@ def connection(nodes, next_cursor=None):
     }}
 
 
+def timeline(nodes, count=None, next_cursor=None):
+    return dict(connection(nodes, next_cursor), filteredCount=len(nodes) if count is None else count)
+
+
 class CollectionTests(unittest.TestCase):
     def test_shared_data_round_trip_uses_only_public_tables(self):
         with TemporaryDirectory() as work:
@@ -174,6 +178,9 @@ class CollectionTests(unittest.TestCase):
                 writer.put_judgment(repo, 1, "judge", "partial", {"outcome_reason": "Private intermediate output"})
                 before = publisher.publish()
                 self.assertNotIn(".assessment.", git_at(repo_path, "ls-tree", "-r", "--name-only", before))
+                with writer.db:
+                    writer.db.execute("INSERT INTO pull_merge_timings VALUES (?, ?, ?, ?)",
+                                      (repo, 1, f"{day}T08:00:00Z", f"{day}T08:30:00Z"))
 
             options = ["--window", day, day, "--model", model, "--output", str(html)]
             with (patch("scorecard.SharedData", side_effect=shared),
@@ -201,6 +208,9 @@ class CollectionTests(unittest.TestCase):
                 self.assertIsNone(publisher.publish())
                 self.assertEqual(list(reader.db.execute("SELECT stage, count(*) FROM judgments GROUP BY stage")),
                                  [("published", 2)])
+                self.assertEqual(list(reader.db.execute("SELECT * FROM pull_merge_timings")), [
+                    (repo, 1, f"{day}T08:00:00Z", f"{day}T08:30:00Z"),
+                ])
                 self.assertEqual(reader.get_judgment(repo, 1, "published", key)["reasoning_effort"], "high")
                 self.assertEqual(reader.get_judgment(repo, 1, "published", key)["threads"], [
                     {"id": "first", "kind": "bug", "status": "addressed", "evidence": [link]},
@@ -215,12 +225,13 @@ class CollectionTests(unittest.TestCase):
         repo = REPOS[0]
         first, empty, recent = date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3)
         merged = "2026-10-01T12:00:00Z"
+        created = "2026-10-01T01:00:00Z"
         pull = {"repo": repo, "number": 1, "merged": merged, "missing_roots": 0, "threads": []}
         github = Mock()
         github.merged.return_value = {1: merged, 2: merged}
 
         def interrupted(repo, pending):
-            yield pull, (4, 0)
+            yield pull, (4, 0), (created, created)
             raise RateLimitError("Try later")
 
         github.pulls.side_effect = interrupted
@@ -231,7 +242,7 @@ class CollectionTests(unittest.TestCase):
                     archive.capture(github, repo, first, empty, recent)
                 self.assertEqual(archive.pending_days(repo, first, empty), [first, empty])
             github.pulls.side_effect = None
-            github.pulls.return_value = iter([(dict(pull, number=2), (0, 9))])
+            github.pulls.return_value = iter([(dict(pull, number=2), (0, 9), (created, None))])
             with closing(Archive(path)) as archive:
                 self.assertEqual(archive.capture(github, repo, first, empty, recent), 1)
                 github.pulls.assert_called_with(repo, {2: merged})
@@ -249,6 +260,9 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(list(archive.db.execute(
                     "SELECT additions, deletions FROM pull_line_counts ORDER BY number"
                 )), [(4, 0), (0, 9)])
+                self.assertEqual(list(archive.db.execute(
+                    "SELECT created_at, ready_at FROM pull_merge_timings ORDER BY number"
+                )), [(created, created), (created, None)])
                 self.assertEqual(archive.pending_days(repo, first, empty), [])
             output = Path(work) / "scorecard.html"
             with patch("scorecard.GitHub", side_effect=AssertionError("report must not contact GitHub")):
@@ -324,6 +338,8 @@ class CollectionTests(unittest.TestCase):
         pr = {
             "number": 1, "mergedAt": merged, "headRefOid": "head", "mergeCommit": {"oid": "merge"},
             "additions": 23, "deletions": 11,
+            "createdAt": before, "isDraft": False,
+            "timelineItems": timeline([{"__typename": "MergedEvent", "id": "m", "createdAt": merged}]),
             "reviewThreads": connection([{
                 "id": "t1", "comments": connection([comment("root", before)], "replies"),
             }], "threads"),
@@ -338,13 +354,50 @@ class CollectionTests(unittest.TestCase):
                 {"id": "t4", "comments": connection([comment("pending", None)])},
             ])}}},
         ]) as query:
-            (pull, counts), = github.pulls(REPOS[0], {1: merged})
+            (pull, counts, timing), = github.pulls(REPOS[0], {1: merged})
             self.assertIn("additions deletions", query.call_args_list[0].args[0])
         self.assertEqual(counts, (23, 11))
+        self.assertEqual(timing, (before, before))
         self.assertNotIn("additions", pull)
         self.assertEqual([thread["id"] for thread in pull["threads"]], ["t1"])
         self.assertEqual(pull["threads"][0]["replies"][0]["url"], "https://example.test/reply")
         self.assertEqual(pull["threads"][0]["reviewed"], "reviewed")
+
+    def test_merge_timing_uses_final_ready_event_before_merge_across_pages(self):
+        created, earlier, merged, after = (f"2026-10-01T{hour:02}:00:00Z" for hour in (1, 2, 3, 4))
+
+        def event(kind, id_, at):
+            return {"__typename": kind, "id": id_, "createdAt": at}
+
+        pr = {"number": 1, "createdAt": created, "mergedAt": merged, "isDraft": False}
+        first = dict(pr, timelineItems=timeline([
+            event("ReadyForReviewEvent", "r1", earlier), event("ConvertToDraftEvent", "d1", earlier),
+        ], count=6, next_cursor="continue"))
+        last = dict(pr, timelineItems=timeline([
+            event("ReadyForReviewEvent", "r2", merged), event("MergedEvent", "m", merged),
+            event("ConvertToDraftEvent", "d2", after), event("ReadyForReviewEvent", "r3", after),
+        ]))
+        github = GitHub()
+        with patch.object(github, "query", side_effect=[
+            {"repository": {"visibility": "PUBLIC", "p1": first}},
+            {"repository": {"visibility": "PUBLIC", "pullRequest": last}},
+        ]) as query:
+            self.assertEqual(list(github.pull_merge_timings(REPOS[0], {1: merged})), [(1, (created, merged))])
+        self.assertEqual(query.call_args.kwargs["cursor"], "continue")
+        self.assertNotIn("reviewThreads", query.call_args_list[0].args[0])
+
+    def test_merge_timing_does_not_use_creation_when_final_readiness_is_unverified(self):
+        created, merged = "2026-10-01T01:00:00Z", "2026-10-01T03:00:00Z"
+        merge = {"__typename": "MergedEvent", "id": "m", "createdAt": merged}
+        draft = {"__typename": "ConvertToDraftEvent", "id": "d", "createdAt": created}
+        pr = {"number": 1, "createdAt": created, "mergedAt": merged, "isDraft": False}
+        github = GitHub()
+        for events in ([], [draft, merge]):
+            with self.subTest(events=events):
+                self.assertEqual(github._merge_timing(REPOS[0], dict(pr, timelineItems=timeline(events))),
+                                 (created, None))
+        with self.assertRaisesRegex(DataError, "Incomplete readiness timeline"):
+            github._merge_timing(REPOS[0], dict(pr, timelineItems=timeline([merge], count=2)))
 
 
 class AssessmentTests(unittest.TestCase):

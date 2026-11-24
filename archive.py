@@ -55,6 +55,10 @@ class Archive:
                 repo TEXT, number INTEGER, additions INTEGER NOT NULL, deletions INTEGER NOT NULL,
                 PRIMARY KEY (repo, number)
             );
+            CREATE TABLE IF NOT EXISTS pull_merge_timings (
+                repo TEXT, number INTEGER, created_at TEXT NOT NULL, ready_at TEXT,
+                PRIMARY KEY (repo, number)
+            );
             CREATE TABLE IF NOT EXISTS pull_authors (
                 repo TEXT, number INTEGER, login TEXT, kind TEXT,
                 PRIMARY KEY (repo, number)
@@ -140,7 +144,7 @@ class Archive:
                 raise DataError(f"Search disagrees with archived merges in {repo} for {first} to {last}; retry later")
             pending = {n: merged for n, merged in expected.items() if n not in saved}
             remaining = set(pending)
-            for pull, (additions, deletions) in github.pulls(repo, pending):
+            for pull, (additions, deletions), (created_at, ready_at) in github.pulls(repo, pending):
                 n, merged = pull["number"], pull["merged"]
                 if n not in remaining or instant(merged) != instant(pending[n]):
                     raise DataError(f"Unexpected archive record for {repo}#{n}")
@@ -150,6 +154,8 @@ class Archive:
                                      merged, encode(pull)))
                     self.db.execute("INSERT OR IGNORE INTO pull_line_counts VALUES (?, ?, ?, ?)",
                                     (repo, n, additions, deletions))
+                    self.db.execute("INSERT OR IGNORE INTO pull_merge_timings VALUES (?, ?, ?, ?)",
+                                    (repo, n, created_at, ready_at))
                 added += 1
                 remaining.remove(n)
             if remaining:

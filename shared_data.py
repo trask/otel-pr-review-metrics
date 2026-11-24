@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from archive import decode, encode
 from assessment import CHANGE_TIMINGS, KINDS, LOCAL_ASSESSMENT_VERSIONS, OUTCOMES, REASONING_EFFORTS
-from github_data import DataError, instant, line_counts, run_command
+from github_data import DataError, instant, line_counts, merge_timing, run_command
 from git_evidence import object_id
 from prepared import SUPPORTED_PREPARED_VERSIONS, digest, json_bytes
 
@@ -217,6 +217,18 @@ class SharedData:
                 (repo, numbers[key], *line_counts(value, f"{repo}#{key}")) for key, value in records.items()
             ])
             return
+        if relative == "merge-timing.json":
+            records = json.loads(blob)
+            pulls = {str(number): (number, merged) for number, merged in self.archive.db.execute(
+                "SELECT number, merged FROM pulls WHERE repo = ?", (repo,),
+            )}
+            if not isinstance(records, dict) or not records.keys() <= pulls.keys():
+                raise DataError(f"Invalid shared merge timings: {path}")
+            self.archive.db.executemany("INSERT OR REPLACE INTO pull_merge_timings VALUES (?, ?, ?, ?)", [
+                (repo, pulls[key][0], *merge_timing(value, pulls[key][1], f"{repo}#{key}"))
+                for key, value in records.items()
+            ])
+            return
         parsed = PR_FILE.fullmatch(relative)
         if not parsed:
             raise DataError(f"Unexpected shared data file: {path}")
@@ -265,6 +277,12 @@ class SharedData:
             counts = {str(n): {"additions": added, "deletions": deleted} for n, added, deleted in sizes}
             if counts:
                 yield f"{repo}/line-changes.json", self.text_record(counts), counts
+            timings = self.archive.db.execute(
+                "SELECT number, created_at, ready_at FROM pull_merge_timings WHERE repo = ?", (repo,),
+            )
+            timing = {str(n): {"created_at": created, "ready_at": ready} for n, created, ready in timings}
+            if timing:
+                yield f"{repo}/merge-timing.json", self.text_record(timing), timing
             rows = self.archive.db.execute("""
                 SELECT number, merged_day, payload FROM pulls
                 WHERE repo = ? ORDER BY merged_day, number

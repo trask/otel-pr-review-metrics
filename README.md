@@ -18,6 +18,8 @@ The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outsi
 
 Capture records GitHub's additions and deletions for new PRs. Publishing stores them in each repository's `line-changes.json`, keyed by PR number. They are kept separate from review and assessment inputs.
 
+Capture also records each new PR's creation time and final readiness. The interval to merge starts at the last Ready for review event before merge, or at creation if the PR opened ready and stayed ready. Publishing stores `created_at` and `ready_at` in `merge-timing.json`, keyed by PR number. A `null` `ready_at` means GitHub did not establish readiness. Older PRs may have no timing record. These timestamps do not change prepared evidence or saved assessments.
+
 `capture-authors` checks only the PR authors missing from the local archive. It uses GitHub without fetching review threads or invalidating saved assessments. Run it after loading new PRs from `data`, or use `capture`, which also checks authors. Use the same `--from` and `--through` dates as the report if they fall outside the default capture window.
 
 ```sh

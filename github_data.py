@@ -36,6 +36,26 @@ def line_counts(record, ref):
     return counts
 
 
+def timing_instant(value, ref):
+    try:
+        at = instant(value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise DataError(f"Invalid PR timestamp for {ref}") from exc
+    if at.tzinfo is None:
+        raise DataError(f"Missing PR timestamp timezone for {ref}")
+    return at
+
+
+def merge_timing(record, merged, ref):
+    if not isinstance(record, dict) or record.keys() != {"created_at", "ready_at"}:
+        raise DataError(f"Invalid merge timing for {ref}")
+    created, ready = record["created_at"], record["ready_at"]
+    start, end = timing_instant(created, ref), timing_instant(merged, ref)
+    if start > end or (ready is not None and not start <= timing_instant(ready, ref) <= end):
+        raise DataError(f"PR timestamps out of order for {ref}")
+    return created, ready
+
+
 def pages(fetch, first):
     seen = set()
     connection = first
@@ -58,9 +78,20 @@ COMMENT = """
 """
 PAGE = "pageInfo { hasNextPage endCursor }"
 THREAD = f"id comments(first:8) {{ {PAGE} nodes {{ {COMMENT} }} }}"
+TIMELINE_TYPES = "itemTypes:[READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT,MERGED_EVENT]"
+TIMELINE_FIELDS = f"""
+    filteredCount {PAGE}
+    nodes {{
+        __typename
+        ... on ReadyForReviewEvent {{ id createdAt }}
+        ... on ConvertToDraftEvent {{ id createdAt }}
+        ... on MergedEvent {{ id createdAt }}
+    }}
+"""
+MERGE_TIMING = f"createdAt isDraft timelineItems(first:10, {TIMELINE_TYPES}) {{ {TIMELINE_FIELDS} }}"
 PULL = (
     f"headRefOid mergeCommit {{ oid }} additions deletions "
-    f"reviewThreads(first:25) {{ {PAGE} nodes {{ {THREAD} }} }}"
+    f"reviewThreads(first:25) {{ {PAGE} nodes {{ {THREAD} }} }} {MERGE_TIMING}"
 )
 
 
@@ -193,7 +224,72 @@ class GitHub:
         owner, name = repo.split("/")
         for node in self._pull_nodes(repo, expected, PULL, 10):
             counts = line_counts(node, f"{repo}#{node['number']}")
-            yield self._pull(repo, owner, name, node), counts
+            timing = self._merge_timing(repo, node)
+            yield self._pull(repo, owner, name, node), counts, timing
+
+    def pull_merge_timings(self, repo, expected):
+        for node in self._pull_nodes(repo, expected, MERGE_TIMING, 25):
+            yield node["number"], self._merge_timing(repo, node)
+
+    def _merge_timing(self, repo, pr):
+        owner, name = repo.split("/")
+        number = pr["number"]
+        ref = f"{repo}#{number}"
+        created = pr.get("createdAt")
+        start, end = timing_instant(created, ref), timing_instant(pr["mergedAt"], ref)
+        draft = pr.get("isDraft")
+        if start > end or type(draft) is not bool:
+            raise DataError(f"Invalid PR opening or draft state for {ref}")
+
+        def check_page(page):
+            if (not isinstance(page, dict) or not isinstance(page.get("nodes"), list)
+                    or type(page.get("filteredCount")) is not int
+                    or not isinstance(page.get("pageInfo"), dict)
+                    or type(page["pageInfo"].get("hasNextPage")) is not bool
+                    or (page["pageInfo"]["hasNextPage"] and not page["pageInfo"].get("endCursor"))):
+                raise DataError(f"Invalid readiness timeline page for {ref}")
+            return page
+
+        def more_events(cursor):
+            result = self.query(
+                "query($owner:String!, $name:String!, $n:Int!, $cursor:String!) "
+                "{ repository(owner:$owner,name:$name) { visibility pullRequest(number:$n) "
+                f"{{ number mergedAt timelineItems(first:100, after:$cursor, {TIMELINE_TYPES}) "
+                f"{{ {TIMELINE_FIELDS} }} }} }} }}",
+                owner=owner, name=name, n=number, cursor=cursor,
+            ).get("repository")
+            node = result.get("pullRequest") if result and result.get("visibility") == "PUBLIC" else None
+            if not node or node.get("number") != number or timing_instant(node.get("mergedAt"), ref) != end:
+                raise DataError(f"Readiness timeline pull request changed for {ref}")
+            return check_page(node.get("timelineItems"))
+
+        first = check_page(pr.get("timelineItems"))
+        seen, events, previous = set(), [], start
+        for event in pages(more_events, first):
+            kind = event.get("__typename") if isinstance(event, dict) else None
+            if kind not in ("ReadyForReviewEvent", "ConvertToDraftEvent", "MergedEvent"):
+                raise DataError(f"Unexpected readiness timeline event for {ref}")
+            event_id, stamp = event.get("id"), event.get("createdAt")
+            at = timing_instant(stamp, ref)
+            if not isinstance(event_id, str) or not event_id or event_id in seen or at < previous:
+                raise DataError(f"Inconsistent readiness timeline for {ref}")
+            seen.add(event_id)
+            events.append((kind, stamp, at))
+            previous = at
+        if len(seen) != first["filteredCount"]:
+            raise DataError(f"Incomplete readiness timeline for {ref}")
+
+        # Timeline order distinguishes readiness and merge events in the same second.
+        merges = [i for i, (kind, _, at) in enumerate(events) if kind == "MergedEvent" and at == end]
+        ready = None
+        if len(merges) == 1:
+            before = [event for event in events[:merges[0]] if event[0] != "MergedEvent"]
+            ready = next((stamp for kind, stamp, _ in reversed(before) if kind == "ReadyForReviewEvent"), None)
+            if not before:
+                after = next((kind for kind, _, _ in events[merges[0] + 1:] if kind != "MergedEvent"), None)
+                if after == "ConvertToDraftEvent" or (after is None and not draft):
+                    ready = created
+        return created, ready
 
     def pull_line_counts(self, repo, expected):
         for node in self._pull_nodes(repo, expected, "additions deletions", 50):
