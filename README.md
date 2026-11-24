@@ -4,11 +4,11 @@ Measure inline review feedback across four public OpenTelemetry repositories. Th
 
 ## Run the scorecard
 
-Use Python 3.10 or newer. Capture needs Git and a GitHub CLI authenticated to `github.com`. Once PR authors are cached, reporting needs only Python.
+Use Python 3.10 or newer. Load the shared data and use GitHub CLI authenticated to `github.com` to check PR authors. The report then runs offline and uses the published baseline findings without calling Copilot.
 
 ```sh
 python scorecard.py load-data
-python scorecard.py capture-authors
+python scorecard.py capture-authors --through 2026-11-15
 python scorecard.py report
 ```
 
@@ -52,26 +52,22 @@ python scorecard.py report --follow-up YYYY-MM-DD YYYY-MM-DD --custom-reviewer '
 
 Repeat `--custom-reviewer` for aliases. Use `--other-bot LOGIN` for unrelated automation using a GitHub User account. GitHub's Bot actor type and `[bot]` logins identify other automation automatically. Remaining User accounts count as Human. If the baseline is run without a custom login, its Automated total uses Copilot only and the Custom reviewer row is marked not measured.
 
-Assessment needs Python 3.11 or newer and the Copilot SDK. Install it and download its runtime:
+## Assess new PRs
+
+The report does not assess new PRs. To assess a follow-up locally with the baseline method, use Python 3.11 or newer and install the Copilot SDK:
 
 ```sh
 python -m pip install -r requirements.txt
 python -m copilot download-runtime
 ```
 
-Set `COPILOT_GITHUB_TOKEN` to a token with Copilot access. The runner also accepts `GH_TOKEN` or `GITHUB_TOKEN` if `COPILOT_GITHUB_TOKEN` is unset. Run `python scorecard.py assess` to measure findings and render the report. Assessment reads the prepared local inputs and calls Copilot without fetching code or PR data. It defaults to GPT-6.2 Sol (`gpt-6.2-sol`) with `high` reasoning effort. Use `--reasoning-effort medium` for a separate run at medium effort. PRs without a prepared bundle are not measured. If the required evidence is missing or exceeds the input budget, the outcome is Unclear. Use the same model, effort, and assessment version across both windows.
-
-To pilot large PRs before the full run, put PRs that require more than one classification request first:
+Set `COPILOT_GITHUB_TOKEN` to a token with Copilot access. The runner also accepts `GH_TOKEN` or `GITHUB_TOKEN`. Prepare evidence and check authors with `capture --with-evidence` for the new dates, then assess the follow-up:
 
 ```sh
-python scorecard.py assess --window 2026-10-01 2026-11-21 --max-prs 25 --prioritize-oversized
+python scorecard.py assess --retrieve-evidence --window START END --custom-reviewer 'your-reviewer[bot]'
 ```
 
-Add `--retrieve-evidence` to retry only `Unclear` outcomes locally. The first pass uses prepared evidence alone and reuses matching static judgments. A retry starts with a smaller evidence bundle and can make up to two read-only Git lookups. It can search PR-changed paths, read a file in the exact reviewed and merged trees, or inspect PR-only diffs for a named path. An empty lookup does not prove there was no fix. The audit keeps the first outcome and records any lookup requests and returned evidence IDs. The classifier stays tool-free. You cannot combine this mode with `--publish-data`.
-
-Use `python scorecard.py assess --publish-data` to load the shared inputs and previously published results, assess missing PRs, and publish completed decisions to `data`. The run saves locally after each PR and pushes every 25 new assessments and at the end. Add `--max-prs 0` to publish eligible cached results without calling Copilot. The shared files contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. They omit raw review text, code, model explanations, and intermediate judgments.
-
-On another machine, run `python scorecard.py load-data` and `python scorecard.py capture-authors` before running `report --window START END` to use those results without calling Copilot. Use the saved `assessment_version`, model ID, and reasoning effort to report on an older run with the same inputs.
+Only `Unclear` outcomes can trigger a retry with read-only Git lookups. The default report reads these results from the same local archive. They do not publish automatically: `--publish-data` only supports assessments made without Git lookups, which the default report does not use. Sharing follow-up findings requires a separate review and publication step.
 
 ## How the agent makes its calls
 
@@ -79,6 +75,4 @@ The classifier sends only the inline thread openers and the IDs, times, and comm
 
 A thread opens when GitHub publishes it, not when it was drafted. The scorecard asks whether the issue shown in the reviewed revision is gone at merge. A rewrite can address a finding without keeping the same patch. If the issue returns before merge, the outcome is Unaddressed and the audit can record that it regressed. The audit records a separate timing result if a patch shows the fix. That result compares the commit's date with publication; it does not prove when the change was pushed or what caused it. Unclear means the code evidence does not settle the merge outcome. GitHub does not expose deleted comments, so the report only counts observable thread openers.
 
-Classification and outcome judgments have separate cache keys based on their prompts, model, reasoning effort, and inputs. Completed judgments are saved even if a later judgment fails. Editing the outcome prompt does not invalidate classifications. Each completed assessment has a versioned JSON audit file under `audit` next to the database, with reasoning and evidence links. Use `report --assessment-version HASH` to render a previous version using the full `assessment_version` in its audit file. The aggregate HTML contains no raw comments or individual assessments.
-
-When changing the prompts or assessment rules, set a new `ASSESSMENT_VERSION` in `assessment.py`. Changes to what capture collects already change the evidence digest if they produce a different bundle.
+Completed judgments are saved as the run proceeds. Local audit files beside the archive record the decision, reasoning, and evidence links. The aggregate report contains no raw comments or individual assessments.

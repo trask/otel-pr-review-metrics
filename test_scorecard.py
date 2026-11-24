@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from archive import Archive, encode
 from assessment import (ASSESSMENT_VERSION, CLASSIFY, CLASSIFY_BATCH, DEDUPLICATE, JUDGE, LOOKUP_JUDGE,
-                        LOCAL_ASSESSMENT_VERSIONS, assess, classify, judge)
+                        LOCAL_ASSESSMENT_VERSIONS, RETRIEVAL_VERSION, assess, classify, judge)
 from copilot_model import AssessmentError, Copilot, input_size
 from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
@@ -147,7 +147,7 @@ class CollectionTests(unittest.TestCase):
         bundle = {"version": PREPARED_VERSION, "input": digest(pull), "records": [{"url": link}],
                   "threads": {"first": {"records": {"merge-commit": 0}}, "duplicate": {"records": {}}}}
         published_version = ASSESSMENT_VERSION
-        model = "test-model"
+        model = "gpt-6.2-sol"
         with TemporaryDirectory() as work:
             root = Path(work)
             repo_path, remote = shared_remote(root)
@@ -195,12 +195,12 @@ class CollectionTests(unittest.TestCase):
                     self.assertEqual(main(["capture-authors", "--archive", str(fresh), "--through", day]), 0)
                 for effort, unclear in (("high", "0.0%"), ("medium", "100.0%")):
                     self.assertEqual(main(["report", "--archive", str(fresh), "--reasoning-effort", effort,
-                                           *options]), 0)
+                                           "--assessment-version", published_version, *options]), 0)
                     text = html.read_text(encoding="utf-8")
                     row = re.search(r'<th scope="row">semantic-conventions-genai</th><td>1</td>(.*?)</tr>', text)
                     self.assertEqual(re.findall(r'class="rate-value">([^<]+)', row.group(1)),
                                      ["1.00", "0.0%", unclear, "0.00"])
-                    self.assertIn(f"test-model ({effort} reasoning effort)", text)
+                    self.assertIn(f"{model} ({effort} reasoning effort)", text)
 
             with closing(Archive(fresh)) as reader:
                 publisher = shared(reader, REPOS)
@@ -216,7 +216,21 @@ class CollectionTests(unittest.TestCase):
                     {"id": "first", "kind": "bug", "status": "addressed", "evidence": [link]},
                     {"id": "duplicate", "kind": None, "status": "duplicate", "original": "first"},
                 ])
+                retrieval_key = judgment_key(model, [RETRIEVAL_VERSION, pull, digest(bundle)], "high")
+                retrieval = dict(result, assessment_version=RETRIEVAL_VERSION, input_digest=retrieval_key,
+                                 threads=[dict(result["threads"][0], status="unaddressed"), result["threads"][1]])
+                record = public_assessment(pull, retrieval, retrieval_key, bundle=bundle)
+                with reader.db:
+                    publisher.load_record(
+                        f"{repo}/2026-10/1.assessment.{retrieval_key}.json", publisher.text_record(record),
+                    )
 
+            with patch.object(Copilot, "ask", side_effect=AssertionError("no model calls")):
+                self.assertEqual(main(["report", "--archive", str(fresh), "--output", str(html)]), 0)
+            text = html.read_text(encoding="utf-8")
+            row = re.search(r'<th scope="row">semantic-conventions-genai.*?</tr>', text)[0]
+            self.assertEqual(re.findall(r'class="rate-value">([^<]+)', row), ["1.00", "100.0%", "0.0%", "0.00"])
+            self.assertNotIn("Assessment version", text)
             result["threads"][0]["evidence"] = [f"https://github.com/{repo}/commit/{'d' * 40}"]
             with self.assertRaises(DataError):
                 public_assessment(pull, result, key, bundle=bundle)

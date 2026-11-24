@@ -333,7 +333,6 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=
                               if legacy else "The issue is gone at merge."),
         unaddressed_definition=("No matching change was found." if legacy else "The issue is still present at merge."),
         model=escape(f"{model} ({reasoning_effort} reasoning effort)"),
-        version=escape(version[:12]),
     )
 
 
@@ -603,7 +602,9 @@ def main(argv=None):
     capture = sub.add_parser("capture", help="update the local archive without using a model")
     authors = sub.add_parser("capture-authors", help="check authors of archived PRs without recapturing them")
     load = sub.add_parser("load-data", help="download the shared data branch without calling the GitHub API")
-    assessment = sub.add_parser("assess", help="assess archived threads and render a report")
+    assessment = sub.add_parser("assess", help="assess archived threads and render a report",
+                                description="Use --retrieve-evidence to match the default report. Without it, "
+                                            "assessments use only prepared evidence.")
     report = sub.add_parser("report", help="render a report offline from the archive")
     for command in (capture, authors, load, assessment, report):
         command.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
@@ -621,7 +622,7 @@ def main(argv=None):
                          help="load and publish captured inputs on the public data branch")
 
     for command in (assessment, report):
-        command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None,
+        command.set_defaults(run=build_report, audit_dir=None,
                              prioritize_oversized=False, retrieve_evidence=False, repo=None)
         command.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                              default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
@@ -632,14 +633,16 @@ def main(argv=None):
         command.add_argument("--reasoning-effort", choices=REASONING_EFFORTS, default=DEFAULT_REASONING_EFFORT,
                              help="reasoning effort for the assessment (default: %(default)s)")
         command.add_argument("--output", type=Path, default=Path(".scorecard", "scorecard.html"))
-    assessment.add_argument("--publish-data", action="store_true", help="load data and publish completed assessments")
+    assessment.set_defaults(assessment_version=ASSESSMENT_VERSION)
+    assessment.add_argument("--publish-data", action="store_true",
+                            help="publish prepared-evidence-only assessments, not used by the default report")
     assessment.add_argument("--audit-dir", type=Path)
     assessment.add_argument("--max-prs", type=int, help="limit new assessments to this many PRs")
     assessment.add_argument("--prioritize-oversized", action="store_true",
                             help="assess PRs that need classification batches first in each window")
     assessment.add_argument("--retrieve-evidence", action="store_true",
                             help="retry unclear outcomes with bounded read-only Git lookups (local only)")
-    report.add_argument("--assessment-version", help="full assessment_version from a saved audit file")
+    report.add_argument("--assessment-version", default=RETRIEVAL_VERSION, help=argparse.SUPPRESS)
     report.add_argument("--repo", action="append", choices=REPOS, metavar="OWNER/NAME",
                         help="include only this repository (repeat to include more)")
 
