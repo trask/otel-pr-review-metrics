@@ -4,10 +4,11 @@ Measure inline review feedback across four public OpenTelemetry repositories. Th
 
 ## Run the scorecard
 
-Use Python 3.10 or newer. Capture needs Git and a GitHub CLI authenticated to `github.com`. Reporting needs only Python.
+Use Python 3.10 or newer. Capture needs Git and a GitHub CLI authenticated to `github.com`. Once PR authors are cached, reporting needs only Python.
 
 ```sh
 python scorecard.py load-data
+python scorecard.py capture-authors
 python scorecard.py report
 ```
 
@@ -16,6 +17,8 @@ python scorecard.py report
 The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outside the worktree. Use `--archive PATH` to use another local file. `load-data` downloads the public `data` branch over Git without calling the GitHub API. The branch stores a coverage file per repository and, by UTC merge month, a JSON file per merged PR plus a compressed evidence file where one has been prepared.
 
 Capture records GitHub's additions and deletions for new PRs. Publishing stores them in each repository's `line-changes.json`, keyed by PR number. They are kept separate from review and assessment inputs.
+
+`capture-authors` checks only the PR authors missing from the local archive. It uses GitHub without fetching review threads or invalidating saved assessments. Run it after loading new PRs from `data`, or use `capture`, which also checks authors. Use the same `--from` and `--through` dates as the report if they fall outside the default capture window.
 
 ```sh
 python scorecard.py capture --with-evidence --publish-data
@@ -31,7 +34,11 @@ python scorecard.py capture --with-evidence --publish-data
 python scorecard.py report --window 2026-10-15 2026-11-20
 ```
 
-The report includes PRs opened before the window and PRs with no inline threads. Dates capture has not finalized are distinct from days with zero merges. To compare with a later window, supply the custom reviewer's exact GitHub login:
+The report excludes PRs opened by GitHub `Bot` actors, logins ending in `[bot]`, or `opentelemetrybot` (case-insensitive). It still counts other PRs, including those with no available author, those opened before the window, and those with no inline threads. Bot reviews on included PRs still count. Dates capture has not finalized are distinct from days with zero merges.
+
+For both Automated and Human findings, the report shows original findings per included merged PR and the percentages of findings that are unaddressed or unclear. Both percentages use all findings, as does the numerator for findings per PR. Each finding type uses the same merged PR denominator.
+
+To compare with a later window, supply the custom reviewer's exact GitHub login:
 
 ```sh
 python scorecard.py report --follow-up YYYY-MM-DD YYYY-MM-DD --custom-reviewer 'your-reviewer[bot]'
@@ -58,13 +65,13 @@ Add `--retrieve-evidence` to retry only `Unclear` outcomes locally. The first pa
 
 Use `python scorecard.py assess --publish-data` to load the shared inputs and previously published results, assess missing PRs, and publish completed decisions to `data`. The run saves locally after each PR and pushes every 25 new assessments and at the end. Add `--max-prs 0` to publish eligible cached results without calling Copilot. The shared files contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. They omit raw review text, code, model explanations, and intermediate judgments.
 
-On another machine, run `python scorecard.py load-data` and then `report --window START END` to use those results without calling Copilot. Use the saved `assessment_version`, model ID, and reasoning effort to report on an older run with the same inputs.
+On another machine, run `python scorecard.py load-data` and `python scorecard.py capture-authors` before running `report --window START END` to use those results without calling Copilot. Use the saved `assessment_version`, model ID, and reasoning effort to report on an older run with the same inputs.
 
 ## How the agent makes its calls
 
 The classifier sends only the inline thread openers and the IDs, times, and commented paths. It classifies them and links clear duplicates to their originals. If a PR exceeds the input budget, it classifies the openers in batches, then checks the finding summaries for duplicates across the whole PR. The outcome pass examines each original finding separately using public GitHub patches and file snapshots from the reviewed revision, later commits and the merged revision. The program checks that evidence links come from those inputs. One Copilot SDK client handles the run, with a fresh session per request, a task-specific system prompt that replaces the default agent prompt, and no tools. Only public evidence goes to Copilot.
 
-A thread opens when GitHub publishes it, not when it was drafted. The scorecard asks whether the issue shown in the reviewed revision is gone at merge. A rewrite can address a finding without keeping the same patch. If the issue returns before merge, the outcome is Unaddressed and the audit can record that it regressed. The audit records a separate timing result if a patch shows the fix. That result compares the commit's date with publication; it does not prove when the change was pushed or what caused it. Unclear means the code evidence does not settle the merge outcome. N/M means no assessment is available. GitHub does not expose deleted comments, so the report only counts observable thread openers.
+A thread opens when GitHub publishes it, not when it was drafted. The scorecard asks whether the issue shown in the reviewed revision is gone at merge. A rewrite can address a finding without keeping the same patch. If the issue returns before merge, the outcome is Unaddressed and the audit can record that it regressed. The audit records a separate timing result if a patch shows the fix. That result compares the commit's date with publication; it does not prove when the change was pushed or what caused it. Unclear means the code evidence does not settle the merge outcome. GitHub does not expose deleted comments, so the report only counts observable thread openers.
 
 Classification and outcome judgments have separate cache keys based on their prompts, model, reasoning effort, and inputs. Completed judgments are saved even if a later judgment fails. Editing the outcome prompt does not invalidate classifications. Each completed assessment has a versioned JSON audit file under `audit` next to the database, with reasoning and evidence links. Use `report --assessment-version HASH` to render a previous version using the full `assessment_version` in its audit file. The aggregate HTML contains no raw comments or individual assessments.
 

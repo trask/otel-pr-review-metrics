@@ -12,7 +12,7 @@ from string import Template
 from subprocess import TimeoutExpired
 
 from archive import DEFAULT_ARCHIVE, Archive
-from assessment import (ASSESSMENT_VERSION, KINDS, OUTCOMES, REASONING_EFFORTS, RETRIEVAL_VERSION, assess,
+from assessment import (ASSESSMENT_VERSION, KINDS, REASONING_EFFORTS, RETRIEVAL_VERSION, assess,
                         needs_classification_batches)
 from copilot_model import DEFAULT_REASONING_EFFORT, AssessmentSetupError, Copilot
 from github_data import DataError, GitHub
@@ -29,11 +29,9 @@ REPOS = (
 )
 BASELINE = (date(2026, 10, 1), date(2026, 11, 15))
 COPILOT = {"copilot-pull-request-reviewer", "copilot-pull-request-reviewer[bot]"}
-GROUPS = ("copilot", "custom", "human", "outside")
+BOT_PR_AUTHORS = {"opentelemetrybot"}
 AUTOMATED = ("copilot", "custom")
-MAIN_GROUPS = (*AUTOMATED, "human")
-UNMEASURED = "N/M"
-NO_DENOMINATOR = "N/A"
+NO_DENOMINATOR = object()
 TEMPLATE = Path(__file__).with_name("scorecard.html")
 COMMAND_ERRORS = (DataError, OSError, TimeoutExpired, sqlite3.Error, ValueError)
 
@@ -51,6 +49,11 @@ def identity(author, custom, outside):
     return "human"
 
 
+def is_bot_pr_author(login, kind):
+    login = (login or "").lower()
+    return kind == "Bot" or login.endswith("[bot]") or login in BOT_PR_AUTHORS
+
+
 @dataclass
 class Stats:
     prs: int = 0
@@ -58,8 +61,8 @@ class Stats:
     unknown_roots: int = 0
     threads: Counter = field(default_factory=Counter)
     pending: Counter = field(default_factory=Counter)
-    outcomes: Counter = field(default_factory=Counter)
     findings: Counter = field(default_factory=Counter)
+    excluded_bot_prs: int = 0
 
     def collect(self, pull, rows, custom, other_bots):
         self.prs += 1
@@ -72,7 +75,6 @@ class Stats:
             if row is None:
                 self.pending[group] += 1
                 continue
-            self.outcomes[group, row["status"]] += 1
             if row["kind"]:
                 self.findings[group, row["kind"], row["status"]] += 1
 
@@ -81,21 +83,12 @@ class Stats:
             self.prs + other.prs, self.missing or other.missing,
             self.unknown_roots + other.unknown_roots,
             self.threads + other.threads, self.pending + other.pending,
-            self.outcomes + other.outcomes, self.findings + other.findings,
+            self.findings + other.findings,
+            self.excluded_bot_prs + other.excluded_bot_prs,
         )
 
-    def total(self, groups):
-        if self.missing or self.unknown_roots:
-            return None
-        return sum(self.threads[g] for g in groups)
-
     def measured(self, groups):
-        return self.total(groups) is not None and not any(self.pending[g] for g in groups)
-
-    def outcome(self, groups, status):
-        if self.measured(groups):
-            return sum(self.outcomes[g, status] for g in groups)
-        return None
+        return not self.missing and not self.unknown_roots and not any(self.pending[g] for g in groups)
 
     def finding(self, groups, status=None, kind=None):
         if self.measured(groups):
@@ -105,18 +98,23 @@ class Stats:
             )
         return None
 
-    def rate(self):
-        findings = self.finding(MAIN_GROUPS)
+    def findings_per_pr(self, groups, kind=None):
+        findings = self.finding(groups, kind=kind)
         if findings is None:
             return None
         return f"{findings / self.prs:,.2f}" if self.prs else NO_DENOMINATOR
 
+    def outcome_pct(self, groups, status, kind=None):
+        findings = self.finding(groups, kind=kind)
+        if findings is None:
+            return None
+        return f"{self.finding(groups, status, kind) / findings:.1%}" if findings else NO_DENOMINATOR
+
 
 def cell(value):
-    if value is None:
-        return f'<td class="missing"><abbr title="Not measured">{UNMEASURED}</abbr></td>'
-    if value == NO_DENOMINATOR:
-        return f'<td class="missing"><abbr title="No merged PRs">{NO_DENOMINATOR}</abbr></td>'
+    if value is None or value is NO_DENOMINATOR:
+        reason = "Not measured" if value is None else "No denominator for this rate"
+        return f'<td class="missing" aria-label="{reason}" title="{reason}">&mdash;</td>'
     text = f"{value:,}" if isinstance(value, int) else value
     return f"<td>{escape(text)}</td>"
 
@@ -139,47 +137,32 @@ def headers(labels):
 def findings_header(lead):
     return (
         "<tr>" + "".join(f'<th scope="col" rowspan="2">{escape(label)}</th>' for label in lead)
-        + '<th scope="colgroup" colspan="2" class="automated">Automated findings</th>'
-        + '<th scope="colgroup" colspan="2">Human findings</th></tr><tr>'
-        + headers(["Addressed", "Unaddressed"] * 2) + "</tr>"
+        + '<th scope="colgroup" colspan="3" class="automated">Automated findings</th>'
+        + '<th scope="colgroup" colspan="3">Human findings</th></tr><tr>'
+        + headers(["Findings per merged PR", "% unaddressed", "% unclear"] * 2) + "</tr>"
     )
+
+
+def finding_rates(stats, kind=None):
+    return [
+        value for groups in (AUTOMATED, ("human",))
+        for value in (stats.findings_per_pr(groups, kind), stats.outcome_pct(groups, "unaddressed", kind),
+                      stats.outcome_pct(groups, "unclear", kind))
+    ]
 
 
 def main_table(label, repos, total):
     def values(stats):
-        return [None if stats.missing else stats.prs, stats.rate()] + [
-            stats.finding(groups, status)
-            for groups in (AUTOMATED, ("human",)) for status in OUTCOMES[:2]
-        ]
+        return [None if stats.missing else stats.prs, *finding_rates(stats)]
 
     body = "".join(row(repo.split("/")[1], values(stats)) for repo, stats in repos.items())
-    return table(label, findings_header(["Repository", "Merged PRs", "Findings per merged PR"]),
-                 body + row("All repositories", values(total), "total"))
+    head = findings_header(["Repository", "Merged PRs"])
+    return table(label, head, body + row("All repositories", values(total), "total"))
 
 
 def types_table(label, total):
-    body = "".join(row(kind.capitalize(), [
-        total.finding(groups, status, kind)
-        for groups in (AUTOMATED, ("human",)) for status in OUTCOMES[:2]
-    ]) for kind in KINDS)
+    body = "".join(row(kind.capitalize(), finding_rates(total, kind)) for kind in KINDS)
     return table(label, findings_header(["Finding type"]), body)
-
-
-def threads_table(label, total, custom):
-    def values(groups):
-        return [total.outcome(groups, status) for status in OUTCOMES] + [total.total(groups)]
-
-    body = (
-        row("Automated total", values(AUTOMATED), "automated total")
-        + row("GitHub Copilot", values(("copilot",)), "child")
-        + row("Custom reviewer", values(("custom",)) if custom else [None] * 6, "child")
-        + row("Human", values(("human",)))
-    )
-    if total.threads["outside"] or total.total(GROUPS) is None:
-        body += row("Other automation / unknown authors", values(("outside",)))
-    body += row("All inline review threads", values(GROUPS), "total")
-    return table(label, "<tr>" + headers(["Reviewer", *(item.capitalize() for item in OUTCOMES), "Total"])
-                 + "</tr>", body)
 
 
 @dataclass
@@ -198,12 +181,14 @@ class Cohort:
 
 
 def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=DEFAULT_REASONING_EFFORT):
-    overview, main, types, threads = [], [], [], []
+    overview, main, types = [], [], []
     for window in cohorts:
         stats = window.total
         counted = sum(stats.threads.values())
         assessed = counted - sum(stats.pending.values())
         note = f"{assessed:,} of {counted:,} visible thread openers assessed."
+        if stats.excluded_bot_prs:
+            note += f" Excluded {stats.excluded_bot_prs:,} bot-authored PRs."
         if stats.missing:
             note += " This window includes days that capture has not finalized."
         if stats.unknown_roots:
@@ -213,20 +198,15 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=
                         f"<p>{escape(note)}</p></article>")
         main.append(main_table(window.label, window.repos, stats))
         types.append(types_table(window.label, stats))
-        threads.append(threads_table(window.label, stats, custom))
-    identity_note = ("Custom reviewer logins: " + ", ".join(sorted(custom)) + "."
-                     if custom else "No custom reviewer was configured for this baseline. "
-                     "The Automated total uses GitHub Copilot only.")
+    custom_reviewers = f" Configured: {', '.join(sorted(custom))}." if custom else ""
     legacy = version == digest("compact-sdk-v1") or version == (
         "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313")
     return Template(TEMPLATE.read_text(encoding="utf-8")).substitute(
         overview="".join(overview), main="".join(main), types="".join(types),
-        threads="".join(threads), identity_note=escape(identity_note),
-        addressed_note=("Addressed requires a matching change after the thread opened that survives at merge."
-                        if legacy else "Addressed means the issue shown in the reviewed code is gone at merge. "
-                        "A rewrite can address it. The audit records fix timing separately when a patch shows it."),
-        unaddressed_note=("Unaddressed means the check found no matching change." if legacy else
-                          "Unaddressed means the issue is still present at merge, even if it was fixed earlier."),
+        custom_reviewers=escape(custom_reviewers),
+        addressed_definition=("A matching change was made after the review opened and survived at merge."
+                              if legacy else "The issue is gone at merge."),
+        unaddressed_definition=("No matching change was found." if legacy else "The issue is still present at merge."),
         model=escape(f"{model} ({reasoning_effort} reasoning effort)"),
         version=escape(version[:12]),
     )
@@ -316,10 +296,20 @@ def assessment_order(archive, dates, prioritize_oversized):
 def collect(archive, args, model, windows, shared=None):
     cohorts, failures, runs = [], 0, 0
     completed = 0
-    for label, dates in windows:
+    authors_by_window = [
+        {repo: archive.pull_authors(repo, *dates) for repo in REPOS} for _, dates in windows
+    ]
+    for (label, dates), authors in zip(windows, authors_by_window, strict=True):
         repos = {repo: Stats(missing=bool(archive.pending_days(repo, *dates))) for repo in REPOS}
         for pull, bundle in assessment_order(archive, dates, args.prioritize_oversized):
-            repo = pull["repo"]
+            repo, number = pull["repo"], pull["number"]
+            author = authors[repo].get(number)
+            if author is None:
+                raise DataError(f"{repo}#{number}: PR was added during report generation. "
+                                "Run `python scorecard.py capture-authors` and retry.")
+            if is_bot_pr_author(*author):
+                repos[repo].excluded_bot_prs += 1
+                continue
             rows = []
             if pull["threads"]:
                 allow = args.command == "assess" and (args.max_prs is None or runs < args.max_prs)
@@ -345,7 +335,8 @@ def collect(archive, args, model, windows, shared=None):
             repos[repo].collect(pull, rows, args.custom_reviewer, args.other_bot)
         for repo, stats in repos.items():
             log(f"{label} | {repo}: {sum(stats.threads.values())} visible threads, "
-                f"{sum(stats.pending.values())} not assessed, {stats.unknown_roots} missing roots")
+                f"{sum(stats.pending.values())} not assessed, {stats.unknown_roots} missing roots, "
+                f"{stats.excluded_bot_prs} bot-authored PRs excluded")
         cohorts.append(Cohort(label, dates, repos))
     return cohorts, failures
 
@@ -360,15 +351,36 @@ def load_data(args, _parser):
     return 0
 
 
-def capture_data(args, parser):
+def capture_window(args, parser):
     today = datetime.now(timezone.utc).date()
     if args.max_rate_wait < 0:
         parser.error("--max-rate-wait cannot be negative")
-    if args.max_evidence_prs is not None and (not args.with_evidence or args.max_evidence_prs < 1):
-        parser.error("--max-evidence-prs requires --with-evidence and a positive limit")
     through = args.through or today
     if not args.start <= through <= today:
         parser.error("capture dates must be in order and no later than today UTC")
+    return through, today
+
+
+def capture_authors_data(args, parser):
+    through, _ = capture_window(args, parser)
+    github = GitHub(args.max_rate_wait)
+    try:
+        if not args.archive.is_file():
+            raise DataError("Archive does not exist. Run `python scorecard.py load-data` or `capture` first.")
+        with closing(Archive(args.archive)) as archive:
+            for repo in REPOS:
+                checked = archive.capture_authors(github, repo, args.start, through)
+                log(f"{repo}: checked authors for {checked:,} archived PRs")
+    except COMMAND_ERRORS as error:
+        log(f"Author capture stopped: {error}")
+        return 1
+    return 0
+
+
+def capture_data(args, parser):
+    through, today = capture_window(args, parser)
+    if args.max_evidence_prs is not None and (not args.with_evidence or args.max_evidence_prs < 1):
+        parser.error("--max-evidence-prs requires --with-evidence and a positive limit")
     github = GitHub(args.max_rate_wait)
     try:
         with closing(Archive(args.archive)) as archive:
@@ -377,6 +389,8 @@ def capture_data(args, parser):
                 log(f"Capturing {repo}")
                 added = archive.capture(github, repo, args.start, through, today)
                 log(f"{repo}: {added} new PRs archived")
+                checked = archive.capture_authors(github, repo, args.start, through)
+                log(f"{repo}: checked authors for {checked:,} archived PRs")
             if args.with_evidence:
                 total_prepared = 0
                 git_root = args.archive.parent / "git"
@@ -450,21 +464,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Build an aggregate scorecard from public GitHub PRs.")
     sub = parser.add_subparsers(dest="command", required=True)
     capture = sub.add_parser("capture", help="update the local archive without using a model")
+    authors = sub.add_parser("capture-authors", help="check authors of archived PRs without recapturing them")
     load = sub.add_parser("load-data", help="download the shared data branch without calling the GitHub API")
     assessment = sub.add_parser("assess", help="assess archived threads and render a report")
     report = sub.add_parser("report", help="render a report offline from the archive")
-    for command in (capture, load, assessment, report):
+    for command in (capture, authors, load, assessment, report):
         command.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
 
     load.set_defaults(run=load_data)
     capture.set_defaults(run=capture_data)
-    capture.add_argument("--from", dest="start", type=date.fromisoformat, default=BASELINE[0])
-    capture.add_argument("--through", type=date.fromisoformat, help="last UTC day to capture (default: today)")
+    authors.set_defaults(run=capture_authors_data)
+    for command in (capture, authors):
+        command.add_argument("--from", dest="start", type=date.fromisoformat, default=BASELINE[0])
+        command.add_argument("--through", type=date.fromisoformat, help="last UTC day to capture (default: today)")
+        command.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
     capture.add_argument("--with-evidence", action="store_true", help="prepare PR evidence for offline assessment")
     capture.add_argument("--max-evidence-prs", type=int, help="cap new PR evidence bundles in this capture")
     capture.add_argument("--publish-data", action="store_true",
                          help="load and publish captured inputs on the public data branch")
-    capture.add_argument("--max-rate-wait", type=int, default=60, metavar="SECONDS")
 
     for command in (assessment, report):
         command.set_defaults(run=build_report, assessment_version=ASSESSMENT_VERSION, audit_dir=None,

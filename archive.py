@@ -55,6 +55,10 @@ class Archive:
                 repo TEXT, number INTEGER, additions INTEGER NOT NULL, deletions INTEGER NOT NULL,
                 PRIMARY KEY (repo, number)
             );
+            CREATE TABLE IF NOT EXISTS pull_authors (
+                repo TEXT, number INTEGER, login TEXT, kind TEXT,
+                PRIMARY KEY (repo, number)
+            );
             CREATE TABLE IF NOT EXISTS complete_days (
                 repo TEXT, day TEXT, PRIMARY KEY (repo, day)
             );
@@ -84,6 +88,44 @@ class Archive:
             (repo, start.isoformat(), end.isoformat()),
         ):
             yield decode(payload)
+
+    def pull_authors(self, repo, start, end):
+        hint = "Run `python scorecard.py capture-authors` for this report window."
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'pull_authors'").fetchone():
+            raise DataError(f"The archive has no PR author metadata. {hint}")
+        authors = {}
+        missing = 0
+        for number, known_number, login, kind in self.db.execute("""
+            SELECT p.number, a.number, a.login, a.kind
+            FROM pulls p LEFT JOIN pull_authors a USING (repo, number)
+            WHERE p.repo = ? AND p.merged_day BETWEEN ? AND ?
+        """, (repo, start.isoformat(), end.isoformat())):
+            if known_number is None:
+                missing += 1
+            else:
+                authors[number] = (login, kind)
+        if missing:
+            raise DataError(f"{repo}: PR authors have not been checked for {missing:,} PRs. {hint}")
+        return authors
+
+    def capture_authors(self, github, repo, start, end):
+        pending = dict(self.db.execute("""
+            SELECT p.number, p.merged FROM pulls p
+            LEFT JOIN pull_authors a USING (repo, number)
+            WHERE p.repo = ? AND p.merged_day BETWEEN ? AND ? AND a.number IS NULL
+        """, (repo, start.isoformat(), end.isoformat())))
+        remaining = set(pending)
+        for number, author in github.pull_authors(repo, pending):
+            if number not in remaining:
+                raise DataError(f"Unexpected PR author record for {repo}#{number}")
+            with self.db:
+                self.db.execute("INSERT OR IGNORE INTO pull_authors VALUES (?, ?, ?, ?)",
+                                (repo, number, author["login"] if author else None,
+                                 author["__typename"] if author else None))
+            remaining.remove(number)
+        if remaining:
+            raise DataError(f"{repo}: GitHub did not return authors for {len(remaining):,} PRs")
+        return len(pending)
 
     def capture(self, github, repo, start, end, today):
         added = 0

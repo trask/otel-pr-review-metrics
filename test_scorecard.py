@@ -16,7 +16,7 @@ from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from outcome_evidence import OutcomeEvidence
 from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
-from scorecard import AUTOMATED, BASELINE, GROUPS, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
+from scorecard import AUTOMATED, BASELINE, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
 
@@ -157,6 +157,7 @@ class CollectionTests(unittest.TestCase):
                     writer.db.executemany("INSERT INTO complete_days VALUES (?, ?)", ((r, day) for r in REPOS))
                     writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                       (repo, 1, day, pull["merged"], encode(pull)))
+                    writer.db.execute("INSERT INTO pull_authors VALUES (?, ?, ?, ?)", (repo, 1, "person", "User"))
                 writer.put_prepared(repo, 1, bundle)
                 for effort, status in (("medium", "unclear"), ("high", "addressed")):
                     key = judgment_key(model, [published_version, pull, digest(bundle)], effort)
@@ -178,11 +179,16 @@ class CollectionTests(unittest.TestCase):
                 self.assertEqual(main(["assess", "--archive", str(local), "--publish-data", "--max-prs", "0",
                                        *options]), 0)
                 self.assertEqual(main(["load-data", "--archive", str(fresh)]), 0)
+                with patch("scorecard.GitHub") as github:
+                    github.return_value.pull_authors.side_effect = lambda repo, pending: [
+                        (n, {"login": "person", "__typename": "User"}) for n in pending
+                    ]
+                    self.assertEqual(main(["capture-authors", "--archive", str(fresh), "--through", day]), 0)
                 self.assertEqual(main(["report", "--archive", str(fresh), *options]), 0)
-                self.assertIn("<td>1</td><td>1.00</td><td>1</td><td>0</td><td>0</td><td>0</td>",
+                self.assertIn("<td>1</td><td>1.00</td><td>0.0%</td><td>0.0%</td><td>0.00</td>",
                               html.read_text(encoding="utf-8"))
                 self.assertEqual(main(["report", "--archive", str(fresh), "--reasoning-effort", "medium", *options]), 0)
-                self.assertIn("<td>1</td><td>1.00</td><td>0</td><td>0</td><td>0</td><td>0</td>",
+                self.assertIn("<td>1</td><td>1.00</td><td>0.0%</td><td>100.0%</td><td>0.00</td>",
                               html.read_text(encoding="utf-8"))
                 self.assertIn("test-model (medium reasoning effort)", html.read_text(encoding="utf-8"))
 
@@ -233,6 +239,8 @@ class CollectionTests(unittest.TestCase):
                 github.reset_mock()
                 archive.capture(github, repo, first, empty, date(2026, 10, 4))
                 github.merged.assert_not_called()
+                github.pull_authors.return_value = [(1, None), (2, None)]
+                archive.capture_authors(github, repo, first, empty)
             with closing(Archive(path, readonly=True)) as archive:
                 self.assertEqual(list(archive.pulls(repo, first, empty)), [pull, dict(pull, number=2)])
                 self.assertEqual(list(archive.db.execute(
@@ -245,6 +253,31 @@ class CollectionTests(unittest.TestCase):
                                        "--window", first.isoformat(), empty.isoformat()]), 0)
             self.assertIn('<th scope="row">semantic-conventions-genai</th><td>2</td>',
                           output.read_text(encoding="utf-8"))
+
+    def test_author_capture_resumes_after_missing_pr_but_keeps_successful_null_author(self):
+        repo, day = REPOS[0], BASELINE[0]
+        merged = "2026-10-01T12:00:00Z"
+        github = GitHub()
+        with TemporaryDirectory() as work, closing(Archive(Path(work) / "archive.sqlite3")) as archive:
+            with archive.db:
+                archive.db.executemany("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                       ((repo, n, day.isoformat(), merged, encode({})) for n in (1, 2)))
+            with patch.object(github, "query", return_value={"repository": {
+                "visibility": "PUBLIC", "p1": {"number": 1, "mergedAt": merged, "author": None},
+                "p2": None,
+            }}):
+                with self.assertRaisesRegex(DataError, "Merge timestamp mismatch"):
+                    archive.capture_authors(github, repo, day, day)
+            with self.assertRaisesRegex(DataError, "have not been checked for 1 PRs"):
+                archive.pull_authors(repo, day, day)
+            with patch.object(github, "query", return_value={"repository": {
+                "visibility": "PUBLIC", "p2": {"number": 2, "mergedAt": merged,
+                                              "author": {"login": "dependabot", "__typename": "Bot"}},
+            }}) as query:
+                self.assertEqual(archive.capture_authors(github, repo, day, day), 1)
+                self.assertNotIn("p1:pullRequest", query.call_args.args[0])
+                self.assertNotIn("reviewThreads", query.call_args.args[0])
+            self.assertEqual(archive.pull_authors(repo, day, day), {1: (None, None), 2: ("dependabot", "Bot")})
 
     def test_rate_limit_with_retry_after_stops_when_wait_is_too_long(self):
         result = SimpleNamespace(returncode=1, stderr="gh: secondary rate limit (HTTP 403)",
@@ -324,6 +357,8 @@ class AssessmentTests(unittest.TestCase):
                 with archive.db:
                     archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                        (pull["repo"], 1, "2026-10-01", pull["merged"], encode(pull)))
+                    archive.db.execute("INSERT INTO pull_authors VALUES (?, ?, ?, ?)",
+                                       (pull["repo"], 1, "person", "User"))
                 archive.put_prepared(pull["repo"], 1, bundle)
             model = Mock(model="test-model", reasoning_effort="high")
             model.ask.side_effect = [
@@ -725,6 +760,36 @@ class AssessmentTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_report_excludes_known_bot_prs_but_keeps_unknown_prs_and_bot_reviews(self):
+        repo, day = REPOS[0], BASELINE[0].isoformat()
+        with TemporaryDirectory() as work:
+            path, output = (Path(work) / name for name in ("archive.sqlite3", "scorecard.html"))
+            with closing(Archive(path)) as archive, archive.db:
+                archive.db.executemany("INSERT INTO complete_days VALUES (?, ?)", ((r, day) for r in REPOS))
+                for number, (login, kind, excluded) in enumerate((
+                    ("machine", "Bot", True),
+                    ("service[BOT]", "User", True),
+                    ("OpenTelemetryBot", "User", True),
+                    (None, None, False),
+                    ("person", "User", False),
+                ), start=1):
+                    pull = {"repo": repo, "number": number, "merged": f"{day}T12:00:00Z",
+                            "missing_roots": int(excluded),
+                            "threads": [{"id": "t", "author": {"login": "copilot-pull-request-reviewer[bot]",
+                                                              "__typename": "Bot"}}]}
+                    archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                       (repo, number, day, pull["merged"], encode(pull)))
+                    archive.db.execute("INSERT INTO pull_authors VALUES (?, ?, ?, ?)", (repo, number, login, kind))
+            self.assertEqual(main(["report", "--archive", str(path), "--output", str(output),
+                                   "--window", day, day]), 0)
+            html = output.read_text(encoding="utf-8")
+            self.assertIn("0 of 2 visible thread openers assessed. Excluded 3 bot-authored PRs.", html)
+            self.assertIn('<th scope="row">semantic-conventions-genai</th><td>2</td>', html)
+            self.assertRegex(html, r'<th scope="row">semantic-conventions-genai</th><td>2</td>'
+                                   r'(?:<td class="missing" aria-label="Not measured" title="Not measured">'
+                                   r'&mdash;</td>){3}<td>0.00</td>')
+            self.assertNotIn("GitHub did not return some thread openers.", html)
+
     def test_account_groups_include_bots_and_configured_users_without_merging_unknowns(self):
         self.assertEqual(identity({"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
                                   set(), set()), "copilot")
@@ -734,7 +799,7 @@ class ReportTests(unittest.TestCase):
                                   set(), {"lookshuman"}), "outside")
         self.assertEqual(identity(None, set(), set()), "outside")
 
-    def test_summed_rate_thread_buckets_and_followup_missing_are_distinct(self):
+    def test_summed_rates_by_repo_and_type_preserve_missing_followup(self):
         stats = Stats()
         authors = [
             {"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
@@ -748,21 +813,54 @@ class ReportTests(unittest.TestCase):
              {"id": "2", "status": "unclear", "kind": "improvement"}],
             {"custom"}, set(),
         )
-        baseline = Cohort("Baseline", BASELINE, {REPOS[0]: stats, REPOS[1]: Stats(prs=3)})
+        second_repo = Stats(prs=2)
+        second_repo.collect(
+            {"missing_roots": 0, "threads": [{"id": "0", "author": authors[0]},
+                                             {"id": "1", "author": authors[1]}]},
+            [{"id": "0", "status": "unaddressed", "kind": "bug"},
+             {"id": "1", "status": "addressed", "kind": "improvement"}],
+            {"custom"}, set(),
+        )
+        baseline = Cohort("Baseline", BASELINE, {REPOS[0]: stats, REPOS[1]: second_repo})
         total = baseline.total
-        self.assertEqual(total.rate(), "0.50")
         self.assertEqual(total.finding(AUTOMATED, "addressed"), 1)
-        self.assertEqual(total.finding(AUTOMATED, "unaddressed"), 0)
-        self.assertEqual(total.total(GROUPS), sum(total.outcomes.values()))
+        self.assertEqual(total.finding(AUTOMATED, "unaddressed"), 1)
         follow_up = Cohort("Follow-up", (date(2026, 11, 16), date(2026, 11, 17)),
                            {REPOS[0]: Stats(missing=True)})
         html = render([baseline, follow_up], {"custom"}, "model")
-        self.assertEqual(html.count("<table>"), 6)
+        self.assertEqual(html.count("<table>"), 4)
         self.assertLess(html.index("Automated findings"), html.index("Human findings"))
-        self.assertIn('<th scope="row">All repositories</th><td>4</td><td>0.50</td>', html)
-        self.assertIn('title="Not measured">N/M</abbr>', html)
-        self.assertIn('<th scope="row">All inline review threads</th><td>1</td><td>0</td>'
-                      '<td>1</td><td>1</td><td>0</td><td>3</td>', html)
+        self.assertEqual(html.count('<th scope="col">Findings per merged PR</th><th scope="col">% unaddressed</th>'
+                                    '<th scope="col">% unclear</th>'), 8)
+        self.assertNotIn('<th scope="col" rowspan="2">Findings per merged PR</th>', html)
+        self.assertIn('<th scope="row">All repositories</th><td>4</td><td>0.75</td>'
+                      '<td>33.3%</td><td>33.3%</td><td>0.25</td><td>0.0%</td><td>0.0%</td>', html)
+        self.assertIn('<th scope="row">Bug</th><td>0.50</td><td>50.0%</td><td>0.0%</td><td>0.00</td>'
+                      '<td class="missing" aria-label="No denominator for this rate" '
+                      'title="No denominator for this rate">&mdash;</td>', html)
+        self.assertIn('<th scope="row">Improvement</th><td>0.25</td><td>0.0%</td>'
+                      '<td>100.0%</td><td>0.25</td><td>0.0%</td><td>0.0%</td>', html)
+        self.assertIn('title="Not measured">&mdash;</td>', html)
+        self.assertNotIn("N/M", html)
+        self.assertNotIn("N/A", html)
+        self.assertNotIn("All inline review threads", html)
+        self.assertIn("5 of 5 visible thread openers assessed.", html)
+
+    def test_scorecard_terms_group_and_define_the_selected_outcomes(self):
+        html = render([], {"custom-reviewer"}, "model")
+        self.assertNotIn("<dt>Human</dt>", html)
+        self.assertRegex(html, r"<dt>Bot</dt>\s*<dd>[^<]*opentelemetrybot automation account\.</dd>")
+        self.assertRegex(html, r"<dt>Automated Finding</dt>\s*<dd>[^<]*GitHub Copilot[^<]*custom-reviewer\.</dd>")
+        self.assertRegex(
+            html,
+            r'<section class="term-group" aria-labelledby="finding-outcomes">\s*'
+            r'<h3[^>]*>Finding outcomes</h3>\s*<dl[^>]*>\s*'
+            r'<dt>Addressed</dt>\s*<dd>The issue is gone at merge\.</dd>\s*'
+            r'<dt>Unaddressed</dt>\s*<dd>The issue is still present at merge\.</dd>\s*<dt>Unclear</dt>',
+        )
+        legacy = render([], set(), "model", digest("compact-sdk-v1"))
+        self.assertRegex(legacy, r"<dt>Addressed</dt>\s*<dd>A matching change was made after the review opened")
+        self.assertRegex(legacy, r"<dt>Unaddressed</dt>\s*<dd>No matching change was found\.</dd>")
 
 
 if __name__ == "__main__":

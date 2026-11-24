@@ -200,6 +200,18 @@ class GitHub:
             number = node["number"]
             yield number, line_counts(node, f"{repo}#{number}")
 
+    def pull_authors(self, repo, expected):
+        for node in self._pull_nodes(repo, expected, "author { login __typename }", 50):
+            number = node["number"]
+            if "author" not in node:
+                raise DataError(f"GitHub did not return the author field for {repo}#{number}")
+            author = node["author"]
+            if author is not None and (not isinstance(author, dict) or any(
+                not isinstance(author.get(field), str) or not author[field] for field in ("login", "__typename")
+            )):
+                raise DataError(f"Invalid author for {repo}#{number}")
+            yield number, author
+
     def _pull(self, repo, owner, name, pr):
         def more_threads(cursor):
             result = self.query(

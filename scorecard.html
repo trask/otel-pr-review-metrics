@@ -77,11 +77,25 @@ thead tr:nth-child(2) th { text-align: right; }
 td { font-variant-numeric: tabular-nums; }
 .automated { background: var(--cp-accent-soft); }
 .total { background: var(--cp-bg-elevated); font-weight: 700; }
-.automated.total { background: var(--cp-accent-soft); }
-.child th { padding-left: 22px; font-weight: 400; }
 .missing { color: var(--cp-text-muted); }
-ul { padding-left: 20px; margin: 0 0 12px; }
-li + li { margin-top: 4px; }
+.term-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  gap: 16px;
+}
+.term-group {
+  margin: 0;
+  padding: 12px 16px;
+  background: var(--cp-bg-elevated);
+  border: 1px solid var(--cp-border);
+  border-radius: .625rem;
+}
+.term-group h3 { margin: 0 0 8px; font-size: 1rem; }
+.terms { margin: 0; }
+.terms dt { font-weight: 600; }
+.terms dd { margin: 0; color: var(--cp-text-muted); overflow-wrap: anywhere; }
+.terms dd + dt { margin-top: 8px; }
+.assessment-details { margin-top: 12px; font-size: .875rem; }
 @media (max-width: 1040px) {
   .pair { grid-auto-flow: row; grid-auto-columns: auto; }
 }
@@ -103,24 +117,35 @@ li + li { margin-top: 4px; }
     <h2 id="by-type">Findings by type</h2>
     <div class="pair">$types</div>
   </section>
-  <section aria-labelledby="all-threads">
-    <h2 id="all-threads">All inline review threads</h2>
-    <div class="pair">$threads</div>
-  </section>
-  <aside aria-labelledby="legend">
-    <h2 id="legend">How to read the scorecard</h2>
-    <ul>
-      <li>The UTC merge date selects the cohort. All merged PRs count, even if they opened before the window or had no threads.</li>
-      <li>Each inline thread counts once under its opener, and only if it was published before merge. Replies can provide evidence. Review summaries, approvals and general PR comments do not count.</li>
-      <li>Automated combines GitHub Copilot and the custom reviewer. Other known automation and unavailable authors are shown separately when present. Human uses GitHub User accounts after excluding known automation.</li>
-      <li>A finding flags a concrete bug, test coverage gap or improvement. A request for a regression test is a coverage gap unless it flags a current bug. The scorecard does not judge whether the claim was correct.</li>
-      <li>$addressed_note</li>
-      <li>$unaddressed_note Unclear means the evidence did not settle the outcome.</li>
-      <li>A later thread is a duplicate only if it flags the same concrete problem and needs no separate fix. Only the original counts as a finding. Questions without a concrete finding and unclassifiable threads are Other.</li>
-      <li>Findings per merged PR includes original findings with unclear outcomes, but excludes reviewers outside Automated and Human. The overall rate divides summed findings by summed merged PRs.</li>
-      <li>N/M means not measured. N/A means there were no merged PRs for a rate. A zero is a measured count.</li>
-    </ul>
-    <p>$identity_note Model: $model. Assessment version: $version. Evidence links stay in the local audit files.</p>
+  <aside aria-labelledby="scorecard-terms">
+    <h2 id="scorecard-terms">Scorecard terms</h2>
+    <div class="term-groups">
+      <section class="term-group" aria-labelledby="what-counts">
+        <h3 id="what-counts">What counts</h3>
+        <dl class="terms">
+          <dt>Merged PR</dt>
+          <dd>A pull request merged in the selected UTC window. Bot-authored PRs are excluded.</dd>
+          <dt>Bot</dt>
+          <dd>An account GitHub marks as a bot, an account with a login ending in [bot], or the opentelemetrybot automation account.</dd>
+          <dt>Finding</dt>
+          <dd>A distinct bug, test coverage gap, or improvement raised in inline review before merge.</dd>
+          <dt>Automated Finding</dt>
+          <dd>A finding from GitHub Copilot or another configured review bot.$custom_reviewers</dd>
+        </dl>
+      </section>
+      <section class="term-group" aria-labelledby="finding-outcomes">
+        <h3 id="finding-outcomes">Finding outcomes</h3>
+        <dl class="terms">
+          <dt>Addressed</dt>
+          <dd>$addressed_definition</dd>
+          <dt>Unaddressed</dt>
+          <dd>$unaddressed_definition</dd>
+          <dt>Unclear</dt>
+          <dd>The evidence did not settle whether the finding was addressed.</dd>
+        </dl>
+      </section>
+    </div>
+    <p class="assessment-details">Model: $model. Assessment version: $version.</p>
   </aside>
 </main>
 </body>
