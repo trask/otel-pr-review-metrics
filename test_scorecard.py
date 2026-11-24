@@ -844,6 +844,8 @@ class ReportTests(unittest.TestCase):
                     ("machine", "Bot", True),
                     ("service[BOT]", "User", True),
                     ("OpenTelemetryBot", "User", True),
+                    ("dependabot", "Bot", True),
+                    ("renovate[bot]", "User", True),
                     (None, None, False),
                     ("person", "User", False),
                 ), start=1):
@@ -854,16 +856,61 @@ class ReportTests(unittest.TestCase):
                     archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                        (repo, number, day, pull["merged"], encode(pull)))
                     archive.db.execute("INSERT INTO pull_authors VALUES (?, ?, ?, ?)", (repo, number, login, kind))
+                    opened = f"{day}T{'00' if excluded else '10'}:00:00Z"
+                    archive.db.execute("INSERT INTO pull_merge_timings VALUES (?, ?, ?, ?)",
+                                       (repo, number, opened, opened))
             self.assertEqual(main(["report", "--archive", str(path), "--output", str(output),
                                    "--window", day, day]), 0)
             html = output.read_text(encoding="utf-8")
-            self.assertIn("0 of 2 visible thread openers assessed. Excluded 3 bot-authored PRs.", html)
+            self.assertIn("0 of 2 visible thread openers assessed. Excluded 5 bot-authored PRs.", html)
+            self.assertIn("<strong>Median time to merge</strong> <span>0.1 days</span> "
+                          "<small>2 merged PRs</small>", html)
             self.assertRegex(html, r'<th scope="row">semantic-conventions-genai'
                                    r'<small class="row-note">2 unassessed</small></th><td>2</td>'
                                    r'(?:<td class="missing" aria-label="Not measured" title="Not measured">'
                                    r'&mdash;</td>){3}<td><span class="rate"><span class="rate-value">0\.00</span>'
                                    r'<small class="rate-count">0 / 2</small>')
             self.assertNotIn("missing thread openers</small>", html)
+
+    def test_report_pools_ready_to_merge_durations_and_keeps_missing_timings_in_cohort(self):
+        day, later = "2026-11-15", "2026-11-16"
+        first, second = REPOS[:2]
+        with TemporaryDirectory() as work:
+            path, output = (Path(work) / name for name in ("archive.sqlite3", "scorecard.html"))
+            with closing(Archive(path)) as archive, archive.db:
+                for number, (repo, merged_day, merged_hour, ready) in enumerate((
+                    (first, day, 1, "2026-11-14T01:00:00Z"),
+                    (second, day, 9, "2026-11-06T09:00:00Z"),
+                    (second, day, 10, "2026-11-05T10:00:00Z"),
+                    (first, day, 3, f"{day}T04:00:00Z"),
+                    (second, day, 4, None),
+                    (second, day, 4, "missing row"),
+                    (first, later, 1, f"{later}T01:00:00Z"),
+                ), start=1):
+                    merged = f"{merged_day}T{merged_hour:02d}:00:00Z"
+                    pull = {"repo": repo, "number": number, "merged": merged, "missing_roots": 0, "threads": []}
+                    archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
+                                       (repo, number, merged_day, merged, encode(pull)))
+                    archive.db.execute("INSERT INTO pull_authors VALUES (?, ?, ?, ?)",
+                                       (repo, number, "person", "User"))
+                    if ready != "missing row":
+                        archive.db.execute("INSERT INTO pull_merge_timings VALUES (?, ?, ?, ?)",
+                                           (repo, number, "2026-10-01T00:00:00Z", ready))
+            with patch("scorecard.log") as log:
+                self.assertEqual(main(["report", "--archive", str(path), "--output", str(output),
+                                       "--follow-up", later, later, "--custom-reviewer", "custom",
+                                       "--repo", first, "--repo", second]), 0)
+                self.assertTrue(any("merge timing unavailable" in call.args[0] for call in log.call_args_list))
+            html = output.read_text(encoding="utf-8")
+            self.assertIn("<strong>Median time to merge</strong> <span>9.0 days</span> "
+                          "<small>6 merged PRs; capture incomplete; timing incomplete</small>", html)
+            self.assertIn("<strong>Median time to merge</strong> <span>0.0 days</span> "
+                          "<small>1 merged PR; capture incomplete</small>", html)
+            self.assertIn('<small class="row-note">Capture incomplete; Timing incomplete</small></th>'
+                          '<td>6</td><td>9.0 days</td><td>9.5 days</td><td>9.8 days</td>', html)
+            self.assertIn('<td>4</td><td>9.5 days</td><td>9.8 days</td><td>9.9 days</td>', html)
+            self.assertIn('<td>1</td><td>0.0 days</td><td>0.0 days</td><td>0.0 days</td>', html)
+            self.assertNotIn("Mean time to merge", html)
 
     def test_selected_repositories_limit_report_scope(self):
         day = BASELINE[0].isoformat()
@@ -876,6 +923,7 @@ class ReportTests(unittest.TestCase):
                 merged = f"{day}T12:00:00Z"
                 archive.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                    (excluded, 1, day, merged, encode({"repo": excluded, "number": 1})))
+                archive.db.execute("DROP TABLE pull_merge_timings")
             self.assertEqual(main(["report", "--archive", str(path), "--output", str(output),
                                    "--window", day, day, "--repo", REPOS[0], "--repo", REPOS[1]]), 0)
             html = output.read_text(encoding="utf-8")
@@ -884,6 +932,11 @@ class ReportTests(unittest.TestCase):
                 self.assertIn(f'<th scope="row">{repo.split("/")[1]}</th>', html)
             self.assertNotIn(excluded.split("/")[1], html)
             self.assertNotIn("Capture is incomplete", html)
+            self.assertIn("<strong>Median time to merge</strong> <span>Not measured</span> "
+                          "<small>0 merged PRs</small>", html)
+            timing = re.search(r'<section aria-labelledby="timing-by-repository">.*?</section>', html, re.S)[0]
+            self.assertIn('<td>0</td>' + '<td class="missing" aria-label="Not measured" title="Not measured">'
+                          '&mdash;</td>' * 3, timing)
 
     def test_account_groups_include_bots_and_configured_users_without_merging_unknowns(self):
         self.assertEqual(identity({"login": "copilot-pull-request-reviewer", "__typename": "Bot"},
@@ -923,7 +976,7 @@ class ReportTests(unittest.TestCase):
         follow_up = Cohort("Follow-up", (date(2026, 11, 16), date(2026, 11, 17)),
                            {REPOS[0]: Stats(missing=True)})
         html = render([baseline, follow_up], {"custom"}, "model")
-        self.assertEqual(html.count("<table>"), 4)
+        self.assertEqual(html.count("<table>"), 6)
         self.assertLess(html.index("Automated findings"), html.index("Human findings"))
         self.assertEqual(html.count('<th scope="col">Findings per merged PR</th><th scope="col">% unaddressed</th>'
                                     '<th scope="col">% unclear</th>'), 8)
@@ -935,10 +988,12 @@ class ReportTests(unittest.TestCase):
                       '<small class="rate-count">1 / 3</small>', total_row)
         self.assertIn('<span class="rate unclear">', total_row)
         bug_row = re.search(r'<th scope="row">Bug</th>(.*?)</tr>', html).group(1)
+        self.assertIn('<small class="rate-count">2 / 4</small>', bug_row)
         self.assertIn('title="No denominator for this rate">&mdash;</td>', bug_row)
         headline = html.split('<div class="headline">', 1)[1].split("</article>", 1)[0]
         self.assertEqual(re.findall(r'class="rate-value">([^<]+)', headline), ["0.75", "33.3%", "0.25", "0.0%"])
-        self.assertIn('title="Not measured">&mdash;</td>', html)
+        empty_types = html.rsplit('<th scope="row">Bug</th>', 1)[1].split("</tr>", 1)[0]
+        self.assertEqual(empty_types.count('title="Not measured">&mdash;</td>'), 6)
         self.assertNotIn("N/M", html)
         self.assertNotIn("N/A", html)
         self.assertNotIn("All inline review threads", html)
@@ -965,6 +1020,11 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(re.findall(r'class="rate-value">([^<]+)', headline), ["0.50", "100.0%", "0.00"])
         total_row = re.search(r'<th scope="row">All repositories(.*?)</tr>', html).group(1)
         self.assertEqual(total_row.count('title="Not measured"'), 6)
+        types = html.split('id="by-type"', 1)[1].split("</section>", 1)[0]
+        self.assertIn("2 merged PRs across 1 of 2 repositories with complete assessments</caption>", types)
+        bug_row = re.search(r'<th scope="row">Bug</th>(.*?)</tr>', types).group(1)
+        self.assertIn('<small class="rate-count">1 / 2</small>', bug_row)
+        self.assertIn('<small class="rate-count">0 / 2</small>', bug_row)
 
     def test_scorecard_terms_group_and_define_the_selected_outcomes(self):
         html = render([], {"custom-reviewer"}, "model")

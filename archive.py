@@ -93,6 +93,18 @@ class Archive:
         ):
             yield decode(payload)
 
+    def pull_merge_timings(self, repo, start, end):
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'pull_merge_timings'").fetchone():
+            return {}
+        return {
+            number: (created, ready)
+            for number, created, ready in self.db.execute("""
+                SELECT p.number, t.created_at, t.ready_at
+                FROM pulls p JOIN pull_merge_timings t USING (repo, number)
+                WHERE p.repo = ? AND p.merged_day BETWEEN ? AND ?
+            """, (repo, start.isoformat(), end.isoformat()))
+        }
+
     def pull_authors(self, repo, start, end):
         hint = "Run `python scorecard.py capture-authors` for this report window."
         if not self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'pull_authors'").fetchone():

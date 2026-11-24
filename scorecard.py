@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from html import escape
 from pathlib import Path
+from statistics import median, quantiles
 from string import Template
 from subprocess import TimeoutExpired
 
@@ -15,7 +16,7 @@ from archive import DEFAULT_ARCHIVE, Archive
 from assessment import (ASSESSMENT_VERSION, KINDS, REASONING_EFFORTS, RETRIEVAL_VERSION, assess,
                         needs_classification_batches)
 from copilot_model import DEFAULT_REASONING_EFFORT, AssessmentSetupError, Copilot
-from github_data import DataError, GitHub
+from github_data import DataError, GitHub, merge_timing, timing_instant
 from outcome_evidence import OutcomeEvidence
 from prepared import Evidence, SUPPORTED_PREPARED_VERSIONS, digest, prepare
 from shared_data import SharedData, judgment_key
@@ -75,6 +76,7 @@ class Stats:
     pending: Counter = field(default_factory=Counter)
     findings: Counter = field(default_factory=Counter)
     excluded_bot_prs: int = 0
+    merge_seconds: list[float] = field(default_factory=list)
 
     def collect(self, pull, rows, custom, other_bots):
         self.prs += 1
@@ -97,6 +99,7 @@ class Stats:
             self.threads + other.threads, self.pending + other.pending,
             self.findings + other.findings,
             self.excluded_bot_prs + other.excluded_bot_prs,
+            self.merge_seconds + other.merge_seconds,
         )
 
     @property
@@ -210,6 +213,44 @@ def types_table(label, total):
     return table(label, findings_header(["Finding type"]), body)
 
 
+def timing_rows(label, repos, total):
+    def timing_row(name, stats, css=""):
+        durations = stats.merge_seconds
+        notes = []
+        if stats.missing:
+            notes.append("Capture incomplete")
+        if len(durations) < stats.prs:
+            notes.append("Timing incomplete")
+        if len(durations) > 1:
+            cuts = quantiles(durations, n=100, method="inclusive")
+            percentiles = [days_display(cuts[p - 1]) for p in (50, 75, 90)]
+        elif durations:
+            percentiles = [days_display(durations[0])] * 3
+        else:
+            percentiles = [None] * 3
+        return row(name, [stats.pr_count, *percentiles], css, "; ".join(notes))
+
+    head = "<tr>" + headers(["Repository", "Merged PRs", "Median (p50)", "p75", "p90"]) + "</tr>"
+    body = "".join(timing_row(repo.split("/")[1], stats) for repo, stats in repos.items())
+    return table(label, head, body + timing_row("All repositories", total, "total"))
+
+
+def days_display(seconds):
+    return f"{seconds / 86_400:,.1f} days"
+
+
+def timing_headline(stats):
+    durations = stats.merge_seconds
+    value = days_display(median(durations)) if durations else "Not measured"
+    count = stats.pr_count
+    merged_prs = ("Merged PR count not measured" if count is None
+                  else f"{count:,} merged {'PR' if count == 1 else 'PRs'}")
+    return (f'<p class="timing-headline"><strong>Median time to merge</strong> <span>{value}</span> '
+            f'<small>{merged_prs}'
+            f'{"; capture incomplete" if stats.missing else ""}'
+            f'{"; timing incomplete" if len(durations) < stats.prs else ""}</small></p>')
+
+
 @dataclass
 class Cohort:
     name: str
@@ -241,20 +282,18 @@ def headline(stats):
     return f'<div class="headline">{groups}</div>'
 
 
-def window_headline(window, total):
+def findings_summary(window, total):
     if any(total.findings_per_pr(groups) is not None for _, groups in FINDING_GROUPS):
-        return headline(total)
+        return total, 0
     measured = [stats for stats in window.repos.values() if stats.prs and
                 all(stats.findings_per_pr(groups) is not None for _, groups in FINDING_GROUPS)]
     if not measured:
-        return headline(total)
-    return (f'<p class="headline-scope">Headline rates cover {len(measured)} of {len(window.repos)} '
-            "repositories, using only those with archived PRs and complete assessments.</p>"
-            + headline(sum(measured, start=Stats())))
+        return total, 0
+    return sum(measured, start=Stats()), len(measured)
 
 
 def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=DEFAULT_REASONING_EFFORT):
-    overview, main, types = [], [], []
+    overview, main, types, timings = [], [], [], []
     for window in cohorts:
         stats = window.total
         counted = sum(stats.threads.values())
@@ -268,17 +307,26 @@ def render(cohorts, custom, model, version=ASSESSMENT_VERSION, reasoning_effort=
         if stats.unknown_roots or stats.unassessed:
             coverage.append("Rates that depend on unassessed or missing thread openers are not shown.")
         coverage_note = f'<p class="coverage">{" ".join(coverage)}</p>' if coverage else ""
+        findings, assessed_repos = findings_summary(window, stats)
+        headline_scope, types_caption = "", window.label
+        if assessed_repos:
+            scope = f"{assessed_repos} of {len(window.repos)} repositories"
+            headline_scope = (f'<p class="headline-scope">Headline rates cover {scope}, '
+                              "using only those with archived PRs and complete assessments.</p>")
+            types_caption += f" | {findings.prs:,} merged PRs across {scope} with complete assessments"
         overview.append(f'<article class="window"><h2>{escape(window.name)}</h2>'
                         f'<p class="dates">{window.dates[0]} to {window.dates[1]} UTC</p>'
-                        f"{coverage_note}{window_headline(window, stats)}<p>{escape(note)}</p></article>")
+                        f"{coverage_note}{headline_scope}{headline(findings)}{timing_headline(stats)}"
+                        f"<p>{escape(note)}</p></article>")
         main.append(main_table(window.label, window.repos, stats))
-        types.append(types_table(window.label, stats))
+        types.append(types_table(types_caption, findings))
+        timings.append(timing_rows(window.label, window.repos, stats))
     custom_reviewers = f" Configured: {', '.join(sorted(custom))}." if custom else ""
     legacy = version == digest("compact-sdk-v1") or version == (
         "83e7535cd200dbab733f135ce12a8fa9b38789b2f77e6530066135a137b19313")
     repo_count = len({repo for window in cohorts for repo in window.repos})
     return Template(TEMPLATE.read_text(encoding="utf-8")).substitute(
-        overview="".join(overview), main="".join(main), types="".join(types),
+        overview="".join(overview), main="".join(main), types="".join(types), timings="".join(timings),
         repositories=f"{repo_count} public {'repository' if repo_count == 1 else 'repositories'}",
         custom_reviewers=escape(custom_reviewers),
         addressed_definition=("A matching change was made after the review opened and survived at merge."
@@ -378,6 +426,7 @@ def collect(archive, args, model, windows, repo_names, shared=None):
     ]
     for (label, dates), authors in zip(windows, authors_by_window, strict=True):
         repos = {repo: Stats(missing=bool(archive.pending_days(repo, *dates))) for repo in repo_names}
+        timings = {repo: archive.pull_merge_timings(repo, *dates) for repo in repo_names}
         for pull, bundle in assessment_order(archive, dates, args.prioritize_oversized, repo_names):
             repo, number = pull["repo"], pull["number"]
             author = authors[repo].get(number)
@@ -387,6 +436,16 @@ def collect(archive, args, model, windows, repo_names, shared=None):
             if is_bot_pr_author(*author):
                 repos[repo].excluded_bot_prs += 1
                 continue
+            if timing := timings[repo].get(number):
+                created, ready = timing
+                ref = f"{repo}#{number}"
+                try:
+                    merge_timing({"created_at": created, "ready_at": ready}, pull["merged"], ref)
+                    if ready is not None:
+                        elapsed = timing_instant(pull["merged"], ref) - timing_instant(ready, ref)
+                        repos[repo].merge_seconds.append(elapsed.total_seconds())
+                except DataError as error:
+                    log(f"{ref}: merge timing unavailable: {error}")
             rows = []
             if pull["threads"]:
                 allow = args.command == "assess" and (args.max_prs is None or runs < args.max_prs)

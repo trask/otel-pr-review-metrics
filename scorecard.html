@@ -113,6 +113,18 @@ p { color: var(--cp-text-muted); }
 .headline-group dd { margin: 4px 0 0; line-height: 1.25; }
 .headline-group .rate-value { font-size: clamp(1.5rem, 3vw, 2rem); }
 .headline-group .missing { font-size: .875rem; }
+.timing-headline {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0 0 12px;
+  padding: 8px 0;
+  border-block: 1px solid var(--cp-border);
+}
+.timing-headline strong, .timing-headline span { color: var(--cp-text); }
+.timing-headline span { font-size: 1.125rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.timing-headline small { color: var(--cp-text-soft); }
 .coverage {
   margin-top: 8px;
   border-inline-start: 3px solid var(--cp-warning);
@@ -199,6 +211,10 @@ summary:focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 4px
     <h2 id="by-repository">Findings by repository</h2>
     <div class="pair">$main</div>
   </section>
+  <section aria-labelledby="timing-by-repository">
+    <h2 id="timing-by-repository">Time to merge by repository</h2>
+    <div class="pair">$timings</div>
+  </section>
   <section aria-labelledby="by-type">
     <h2 id="by-type">Findings by type</h2>
     <div class="pair">$types</div>
@@ -212,6 +228,8 @@ summary:focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 4px
           <dl class="terms">
             <dt>Merged PR</dt>
             <dd>A pull request merged in the selected UTC window. Bot-authored PRs are excluded.</dd>
+            <dt>Time to merge</dt>
+            <dd>Time runs from the final Ready for review event to merge, or from creation if the PR opened ready and never went back to draft. The median, p75, and p90 are the times by which roughly 50%, 75%, and 90% of PRs with valid timing had merged.</dd>
             <dt>Bot</dt>
             <dd>An account GitHub marks as a bot, an account with a login ending in [bot], or the opentelemetrybot automation account.</dd>
             <dt>Finding</dt>
