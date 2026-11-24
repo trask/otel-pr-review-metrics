@@ -228,7 +228,7 @@ class CollectionTests(unittest.TestCase):
         created = "2026-10-01T01:00:00Z"
         pull = {"repo": repo, "number": 1, "merged": merged, "missing_roots": 0, "threads": []}
         github = Mock()
-        github.merged.return_value = {1: merged, 2: merged}
+        github.merged.return_value = {1: merged, 2: merged, 3: merged}
 
         def interrupted(repo, pending):
             yield pull, (4, 0), (created, created)
@@ -242,10 +242,13 @@ class CollectionTests(unittest.TestCase):
                     archive.capture(github, repo, first, empty, recent)
                 self.assertEqual(archive.pending_days(repo, first, empty), [first, empty])
             github.pulls.side_effect = None
-            github.pulls.return_value = iter([(dict(pull, number=2), (0, 9), (created, None))])
+            github.pulls.return_value = iter([
+                (dict(pull, number=2), (0, 9), (created, None)),
+                (dict(pull, number=3), (1, 1), None),
+            ])
             with closing(Archive(path)) as archive:
-                self.assertEqual(archive.capture(github, repo, first, empty, recent), 1)
-                github.pulls.assert_called_with(repo, {2: merged})
+                self.assertEqual(archive.capture(github, repo, first, empty, recent), 2)
+                github.pulls.assert_called_with(repo, {2: merged, 3: merged})
                 github.merged.return_value = {}
                 github.pulls.return_value = iter([])
                 archive.capture(github, repo, first, empty, date(2026, 10, 4))
@@ -253,13 +256,13 @@ class CollectionTests(unittest.TestCase):
                 github.reset_mock()
                 archive.capture(github, repo, first, empty, date(2026, 10, 4))
                 github.merged.assert_not_called()
-                github.pull_authors.return_value = [(1, None), (2, None)]
+                github.pull_authors.return_value = [(1, None), (2, None), (3, None)]
                 archive.capture_authors(github, repo, first, empty)
             with closing(Archive(path, readonly=True)) as archive:
-                self.assertEqual(list(archive.pulls(repo, first, empty)), [pull, dict(pull, number=2)])
+                self.assertEqual(list(archive.pulls(repo, first, empty)), [dict(pull, number=n) for n in (1, 2, 3)])
                 self.assertEqual(list(archive.db.execute(
                     "SELECT additions, deletions FROM pull_line_counts ORDER BY number"
-                )), [(4, 0), (0, 9)])
+                )), [(4, 0), (0, 9), (1, 1)])
                 self.assertEqual(list(archive.db.execute(
                     "SELECT created_at, ready_at FROM pull_merge_timings ORDER BY number"
                 )), [(created, created), (created, None)])
@@ -268,7 +271,7 @@ class CollectionTests(unittest.TestCase):
             with patch("scorecard.GitHub", side_effect=AssertionError("report must not contact GitHub")):
                 self.assertEqual(main(["report", "--archive", str(path), "--output", str(output),
                                        "--window", first.isoformat(), empty.isoformat()]), 0)
-            self.assertIn('<th scope="row">semantic-conventions-genai</th><td>2</td>',
+            self.assertIn('<th scope="row">semantic-conventions-genai</th><td>3</td>',
                           output.read_text(encoding="utf-8"))
 
     def test_author_capture_resumes_after_missing_pr_but_keeps_successful_null_author(self):
@@ -398,6 +401,21 @@ class CollectionTests(unittest.TestCase):
                                  (created, None))
         with self.assertRaisesRegex(DataError, "Incomplete readiness timeline"):
             github._merge_timing(REPOS[0], dict(pr, timelineItems=timeline([merge], count=2)))
+        with self.assertLogs("github_data", level="WARNING") as logs:
+            self.assertIsNone(github._merge_timing(REPOS[0], dict(pr, createdAt="2026-10-01T04:00:00Z")))
+        self.assertIn("GitHub creation time follows merge", logs.output[0])
+
+    def test_merge_timing_uses_merge_timestamp_when_merge_event_is_delayed(self):
+        created, ready, merged, recorded = (f"2026-10-01T01:00:0{s}Z" for s in range(4))
+        merge = {"__typename": "MergedEvent", "id": "m", "createdAt": recorded}
+        event = {"__typename": "ReadyForReviewEvent", "id": "r", "createdAt": ready}
+        pr = {"number": 1, "createdAt": created, "mergedAt": merged, "isDraft": False}
+        github = GitHub()
+        for events, expected in (([merge], created), ([event, merge], ready),
+                                 ([dict(event, createdAt=merged), merge], None)):
+            with self.subTest(events=events):
+                self.assertEqual(github._merge_timing(REPOS[0], dict(pr, timelineItems=timeline(events))),
+                                 (created, expected))
 
 
 class AssessmentTests(unittest.TestCase):

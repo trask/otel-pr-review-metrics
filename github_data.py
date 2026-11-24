@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -238,8 +239,11 @@ class GitHub:
         created = pr.get("createdAt")
         start, end = timing_instant(created, ref), timing_instant(pr["mergedAt"], ref)
         draft = pr.get("isDraft")
-        if start > end or type(draft) is not bool:
-            raise DataError(f"Invalid PR opening or draft state for {ref}")
+        if start > end:
+            logging.getLogger(__name__).warning("Merge timing unavailable for %s: GitHub creation time follows merge", ref)
+            return None
+        if type(draft) is not bool:
+            raise DataError(f"Invalid PR draft state for {ref}")
 
         def check_page(page):
             if (not isinstance(page, dict) or not isinstance(page.get("nodes"), list)
@@ -281,15 +285,17 @@ class GitHub:
 
         # Timeline order distinguishes readiness and merge events in the same second.
         merges = [i for i, (kind, _, at) in enumerate(events) if kind == "MergedEvent" and at == end]
-        ready = None
-        if len(merges) == 1:
-            before = [event for event in events[:merges[0]] if event[0] != "MergedEvent"]
-            ready = next((stamp for kind, stamp, _ in reversed(before) if kind == "ReadyForReviewEvent"), None)
-            if not before:
-                after = next((kind for kind, _, _ in events[merges[0] + 1:] if kind != "MergedEvent"), None)
-                if after == "ConvertToDraftEvent" or (after is None and not draft):
-                    ready = created
-        return created, ready
+        changes = [(i, kind, stamp, at) for i, (kind, stamp, at) in enumerate(events) if kind != "MergedEvent"]
+        if len(merges) != 1 and any(at == end for _, _, _, at in changes):
+            return created, None
+        before = [(kind, stamp) for i, kind, stamp, at in changes
+                  if at < end or (at == end and i < merges[0])]
+        if before:
+            return created, next((stamp for kind, stamp in reversed(before) if kind == "ReadyForReviewEvent"), None)
+        if any(kind == "MergedEvent" for kind, _, _ in events):
+            if (changes and changes[0][1] == "ConvertToDraftEvent") or (not changes and not draft):
+                return created, created
+        return created, None
 
     def pull_line_counts(self, repo, expected):
         for node in self._pull_nodes(repo, expected, "additions deletions", 50):
