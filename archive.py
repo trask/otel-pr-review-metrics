@@ -51,6 +51,10 @@ class Archive:
                 PRIMARY KEY (repo, number)
             );
             CREATE INDEX IF NOT EXISTS pulls_by_day ON pulls(repo, merged_day, number);
+            CREATE TABLE IF NOT EXISTS pull_line_counts (
+                repo TEXT, number INTEGER, additions INTEGER NOT NULL, deletions INTEGER NOT NULL,
+                PRIMARY KEY (repo, number)
+            );
             CREATE TABLE IF NOT EXISTS complete_days (
                 repo TEXT, day TEXT, PRIMARY KEY (repo, day)
             );
@@ -94,7 +98,7 @@ class Archive:
                 raise DataError(f"Search disagrees with archived merges in {repo} for {first} to {last}; retry later")
             pending = {n: merged for n, merged in expected.items() if n not in saved}
             remaining = set(pending)
-            for pull in github.pulls(repo, pending):
+            for pull, (additions, deletions) in github.pulls(repo, pending):
                 n, merged = pull["number"], pull["merged"]
                 if n not in remaining or instant(merged) != instant(pending[n]):
                     raise DataError(f"Unexpected archive record for {repo}#{n}")
@@ -102,6 +106,8 @@ class Archive:
                     self.db.execute("INSERT OR IGNORE INTO pulls VALUES (?, ?, ?, ?, ?)",
                                     (repo, n, instant(merged).astimezone(timezone.utc).date().isoformat(),
                                      merged, encode(pull)))
+                    self.db.execute("INSERT OR IGNORE INTO pull_line_counts VALUES (?, ?, ?, ?)",
+                                    (repo, n, additions, deletions))
                 added += 1
                 remaining.remove(n)
             if remaining:

@@ -15,6 +15,8 @@ python scorecard.py report
 
 The local archive defaults to `~/.otel-pr-review-metrics/archive.sqlite3`, outside the worktree. Use `--archive PATH` to use another local file. `load-data` downloads the public `data` branch over Git without calling the GitHub API. The branch stores a coverage file per repository and, by UTC merge month, a JSON file per merged PR plus a compressed evidence file where one has been prepared.
 
+Capture records GitHub's additions and deletions for new PRs. Publishing stores them in each repository's `line-changes.json`, keyed by PR number. They are kept separate from review and assessment inputs.
+
 ```sh
 python scorecard.py capture --with-evidence --publish-data
 ```

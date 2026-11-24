@@ -29,6 +29,13 @@ def instant(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def line_counts(record, ref):
+    counts = record.get("additions"), record.get("deletions")
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise DataError(f"Invalid line counts for {ref}")
+    return counts
+
+
 def pages(fetch, first):
     seen = set()
     connection = first
@@ -52,7 +59,7 @@ COMMENT = """
 PAGE = "pageInfo { hasNextPage endCursor }"
 THREAD = f"id comments(first:8) {{ {PAGE} nodes {{ {COMMENT} }} }}"
 PULL = (
-    f"number mergedAt headRefOid mergeCommit {{ oid }} "
+    f"headRefOid mergeCommit {{ oid }} additions deletions "
     f"reviewThreads(first:25) {{ {PAGE} nodes {{ {THREAD} }} }}"
 )
 
@@ -161,24 +168,37 @@ class GitHub:
                 result[pr["number"]] = value
         return result
 
-    def pulls(self, repo, expected):
+    def _pull_nodes(self, repo, expected, fields, batch_size):
         owner, name = repo.split("/")
         numbers = sorted(expected)
-        for offset in range(0, len(numbers), 10):
-            fields = " ".join(
-                f"p{n}:pullRequest(number:{n}) {{ {PULL} }}" for n in numbers[offset:offset + 10]
+        for offset in range(0, len(numbers), batch_size):
+            batch = numbers[offset:offset + batch_size]
+            selections = " ".join(
+                f"p{n}:pullRequest(number:{n}) {{ number mergedAt {fields} }}" for n in batch
             )
             result = self.query(
                 "query($owner:String!, $name:String!) { repository(owner:$owner,name:$name) "
-                f"{{ visibility {fields} }} }}", owner=owner, name=name,
+                f"{{ visibility {selections} }} }}", owner=owner, name=name,
             )["repository"]
-            if not result or result.pop("visibility") != "PUBLIC":
+            if not result or result.get("visibility") != "PUBLIC":
                 raise DataError(f"{repo} is not public")
-            for n in numbers[offset:offset + 10]:
-                node = result[f"p{n}"]
-                if not node or not node["mergedAt"] or instant(node["mergedAt"]) != instant(expected[n]):
+            for n in batch:
+                node = result.get(f"p{n}")
+                if (not node or node.get("number") != n or not node.get("mergedAt")
+                        or instant(node["mergedAt"]) != instant(expected[n])):
                     raise DataError(f"Merge timestamp mismatch for {repo}#{n}")
-                yield self._pull(repo, owner, name, node)
+                yield node
+
+    def pulls(self, repo, expected):
+        owner, name = repo.split("/")
+        for node in self._pull_nodes(repo, expected, PULL, 10):
+            counts = line_counts(node, f"{repo}#{node['number']}")
+            yield self._pull(repo, owner, name, node), counts
+
+    def pull_line_counts(self, repo, expected):
+        for node in self._pull_nodes(repo, expected, "additions deletions", 50):
+            number = node["number"]
+            yield number, line_counts(node, f"{repo}#{number}")
 
     def _pull(self, repo, owner, name, pr):
         def more_threads(cursor):

@@ -107,6 +107,7 @@ class CollectionTests(unittest.TestCase):
                     writer.db.execute("INSERT INTO complete_days VALUES (?, ?)", (REPOS[0], "2026-10-01"))
                     writer.db.execute("INSERT INTO pulls VALUES (?, ?, ?, ?, ?)",
                                       (REPOS[0], 1, "2026-10-01", pull["merged"], encode(pull)))
+                    writer.db.execute("INSERT INTO pull_line_counts VALUES (?, ?, ?, ?)", (REPOS[0], 1, 0, 12))
                 writer.put_prepared(REPOS[0], 1, legacy)
                 writer.put_prepared(REPOS[0], 1, bundle)
                 writer.put_judgment(REPOS[0], 1, "judge", "test", {"status": "addressed"})
@@ -116,12 +117,14 @@ class CollectionTests(unittest.TestCase):
                 self.assertIn(f"{REPOS[0]}/2026-10/1.json", files)
                 self.assertIn(f"{REPOS[0]}/2026-10/1.evidence.json.gz", files)
                 self.assertIn(f"{REPOS[0]}/2026-10/1.evidence.v{PREPARED_VERSION}.json.gz", files)
+                self.assertIn(f"{REPOS[0]}/line-changes.json", files)
                 self.assertNotIn("archive.sqlite3", files)
             with closing(Archive(root / "reader.sqlite3")) as reader:
                 SharedData(reader, REPOS, remote=str(remote), cwd=repo_path).load()
                 self.assertEqual(reader.pending_days(REPOS[0], BASELINE[0], BASELINE[0]), [])
                 self.assertEqual(reader.get_prepared(pull), bundle)
                 self.assertEqual(reader.get_prepared(pull, 1), legacy)
+                self.assertEqual(list(reader.db.execute("SELECT * FROM pull_line_counts")), [(REPOS[0], 1, 0, 12)])
                 self.assertIsNone(reader.get_judgment(REPOS[0], 1, "judge", "test"))
 
     def test_published_results_are_versioned_and_reusable_without_a_model(self):
@@ -208,7 +211,7 @@ class CollectionTests(unittest.TestCase):
         github.merged.return_value = {1: merged, 2: merged}
 
         def interrupted(repo, pending):
-            yield pull
+            yield pull, (4, 0)
             raise RateLimitError("Try later")
 
         github.pulls.side_effect = interrupted
@@ -219,7 +222,7 @@ class CollectionTests(unittest.TestCase):
                     archive.capture(github, repo, first, empty, recent)
                 self.assertEqual(archive.pending_days(repo, first, empty), [first, empty])
             github.pulls.side_effect = None
-            github.pulls.return_value = iter([dict(pull, number=2)])
+            github.pulls.return_value = iter([(dict(pull, number=2), (0, 9))])
             with closing(Archive(path)) as archive:
                 self.assertEqual(archive.capture(github, repo, first, empty, recent), 1)
                 github.pulls.assert_called_with(repo, {2: merged})
@@ -231,7 +234,10 @@ class CollectionTests(unittest.TestCase):
                 archive.capture(github, repo, first, empty, date(2026, 10, 4))
                 github.merged.assert_not_called()
             with closing(Archive(path, readonly=True)) as archive:
-                self.assertEqual([pr["number"] for pr in archive.pulls(repo, first, empty)], [1, 2])
+                self.assertEqual(list(archive.pulls(repo, first, empty)), [pull, dict(pull, number=2)])
+                self.assertEqual(list(archive.db.execute(
+                    "SELECT additions, deletions FROM pull_line_counts ORDER BY number"
+                )), [(4, 0), (0, 9)])
                 self.assertEqual(archive.pending_days(repo, first, empty), [])
             output = Path(work) / "scorecard.html"
             with patch("scorecard.GitHub", side_effect=AssertionError("report must not contact GitHub")):
@@ -281,20 +287,25 @@ class CollectionTests(unittest.TestCase):
         before, merged, after = ("2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z")
         pr = {
             "number": 1, "mergedAt": merged, "headRefOid": "head", "mergeCommit": {"oid": "merge"},
+            "additions": 23, "deletions": 11,
             "reviewThreads": connection([{
                 "id": "t1", "comments": connection([comment("root", before)], "replies"),
             }], "threads"),
         }
         github = GitHub()
         with patch.object(github, "query", side_effect=[
+            {"repository": {"visibility": "PUBLIC", "p1": pr}},
             {"node": {"comments": connection([comment("reply", before, reply=True)])}},
             {"repository": {"visibility": "PUBLIC", "pullRequest": {"reviewThreads": connection([
                 {"id": "t2", "comments": connection([comment("at-merge", merged)])},
                 {"id": "t3", "comments": connection([comment("post-merge", after)])},
                 {"id": "t4", "comments": connection([comment("pending", None)])},
             ])}}},
-        ]):
-            pull = github._pull(REPOS[0], *REPOS[0].split("/"), pr)
+        ]) as query:
+            (pull, counts), = github.pulls(REPOS[0], {1: merged})
+            self.assertIn("additions deletions", query.call_args_list[0].args[0])
+        self.assertEqual(counts, (23, 11))
+        self.assertNotIn("additions", pull)
         self.assertEqual([thread["id"] for thread in pull["threads"]], ["t1"])
         self.assertEqual(pull["threads"][0]["replies"][0]["url"], "https://example.test/reply")
         self.assertEqual(pull["threads"][0]["reviewed"], "reviewed")

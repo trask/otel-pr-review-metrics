@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from archive import decode, encode
 from assessment import CHANGE_TIMINGS, KINDS, LOCAL_ASSESSMENT_VERSIONS, OUTCOMES, REASONING_EFFORTS
-from github_data import DataError, instant, run_command
+from github_data import DataError, instant, line_counts, run_command
 from git_evidence import object_id
 from prepared import SUPPORTED_PREPARED_VERSIONS, digest, json_bytes
 
@@ -204,6 +204,19 @@ class SharedData:
             self.archive.db.executemany("INSERT OR IGNORE INTO complete_days VALUES (?, ?)",
                                        ((repo, day) for day in value))
             return
+        if relative == "line-changes.json":
+            records = json.loads(blob)
+            numbers = {str(number): number for (number,) in self.archive.db.execute(
+                "SELECT number FROM pulls WHERE repo = ?", (repo,),
+            )}
+            if not isinstance(records, dict) or any(
+                key not in numbers or not isinstance(value, dict) for key, value in records.items()
+            ):
+                raise DataError(f"Invalid shared line counts: {path}")
+            self.archive.db.executemany("INSERT OR REPLACE INTO pull_line_counts VALUES (?, ?, ?, ?)", [
+                (repo, numbers[key], *line_counts(value, f"{repo}#{key}")) for key, value in records.items()
+            ])
+            return
         parsed = PR_FILE.fullmatch(relative)
         if not parsed:
             raise DataError(f"Unexpected shared data file: {path}")
@@ -246,6 +259,12 @@ class SharedData:
             complete = self.archive.db.execute("SELECT day FROM complete_days WHERE repo = ? ORDER BY day",
                                               (repo,))
             yield f"{repo}/coverage.json", self.text_record([day for (day,) in complete]), None
+            sizes = self.archive.db.execute(
+                "SELECT number, additions, deletions FROM pull_line_counts WHERE repo = ?", (repo,),
+            )
+            counts = {str(n): {"additions": added, "deletions": deleted} for n, added, deleted in sizes}
+            if counts:
+                yield f"{repo}/line-changes.json", self.text_record(counts), counts
             rows = self.archive.db.execute("""
                 SELECT number, merged_day, payload FROM pulls
                 WHERE repo = ? ORDER BY merged_day, number
