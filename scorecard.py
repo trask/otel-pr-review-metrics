@@ -11,6 +11,7 @@ from pathlib import Path
 from statistics import median, quantiles
 from string import Template
 from subprocess import TimeoutExpired
+from tempfile import TemporaryDirectory
 
 from archive import DEFAULT_ARCHIVE, Archive
 from assessment import (ASSESSMENT_VERSION, KINDS, REASONING_EFFORTS, RETRIEVAL_VERSION, assess,
@@ -19,6 +20,7 @@ from copilot_model import DEFAULT_REASONING_EFFORT, AssessmentSetupError, Copilo
 from github_data import DataError, GitHub, merge_timing, timing_instant
 from outcome_evidence import OutcomeEvidence
 from prepared import Evidence, SUPPORTED_PREPARED_VERSIONS, digest, prepare
+from review_instructions import Snapshot, archived_examples, draft_rules, render_rules
 from shared_data import SharedData, judgment_key
 
 
@@ -597,6 +599,46 @@ def build_report(args, parser):
     return int(bool(failures))
 
 
+def draft_instructions(args, parser):
+    dates = tuple(args.window)
+    if dates[0] > dates[1]:
+        parser.error("window dates must be in order")
+    repo = args.repo.lower()
+    try:
+        if not args.archive.is_file():
+            raise DataError("Archive does not exist. Run `python scorecard.py load-data` first.")
+        with closing(Archive(args.archive, readonly=True)) as archive:
+            logins = BOT_PR_AUTHORS | {login.lower() for login in args.other_bot}
+            examples, addressed = archived_examples(
+                archive, repo, dates, human=lambda author: identity(author, set(), logins) == "human",
+                bot_pr=is_bot_pr_author,
+            )
+        log(f"{repo}: {len(examples)} paired examples from {addressed} addressed human findings")
+        if not examples:
+            log("No paired review examples; drafting from repository guides only")
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            snapshot = Snapshot.fetch(repo, root / "repository.git")
+            with closing(Copilot(args.model, args.reasoning_effort)) as model:
+                rules, sources = draft_rules(model, snapshot, repo, examples)
+            files, evidence = render_rules(rules, sources)
+            patch, removed = snapshot.replacement(files, root / "draft.index")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = args.output_dir / "copilot-instructions.patch"
+        patch_path.write_bytes(patch)
+        write_atomic(args.output_dir / "copilot-instructions.evidence.json", json.dumps({
+            "repo": repo, "revision": snapshot.revision, "window": [day.isoformat() for day in dates],
+            "model": args.model, "reasoning_effort": args.reasoning_effort,
+            "paired_examples": len(examples), "addressed_findings": addressed,
+            "removed_files": removed, "draft_files": sorted(files), "rules": evidence,
+        }, ensure_ascii=False, indent=2) + "\n")
+    except COMMAND_ERRORS as error:
+        log(f"Instruction draft stopped: {error}")
+        return 1
+    print(patch_path)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Build an aggregate scorecard from public GitHub PRs.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -607,7 +649,8 @@ def main(argv=None):
                                 description="Use --retrieve-evidence to match the default report. Without it, "
                                             "assessments use only prepared evidence.")
     report = sub.add_parser("report", help="render a report offline from the archive")
-    for command in (capture, authors, load, assessment, report):
+    draft = sub.add_parser("draft-instructions", help="draft a local replacement for a public repo's Copilot rules")
+    for command in (capture, authors, load, assessment, report, draft):
         command.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
 
     load.set_defaults(run=load_data)
@@ -646,6 +689,16 @@ def main(argv=None):
     report.add_argument("--assessment-version", default=RETRIEVAL_VERSION, help=argparse.SUPPRESS)
     report.add_argument("--repo", action="append", choices=REPOS, metavar="OWNER/NAME",
                         help="include only this repository (repeat to include more)")
+
+    draft.set_defaults(run=draft_instructions)
+    draft.add_argument("--repo", required=True, metavar="OWNER/NAME", help="public github.com repository")
+    draft.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
+                       default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
+    draft.add_argument("--model", default="gpt-6.2-sol", help="GitHub Copilot CLI model ID (default: %(default)s)")
+    draft.add_argument("--reasoning-effort", choices=REASONING_EFFORTS, default=DEFAULT_REASONING_EFFORT)
+    draft.add_argument("--other-bot", action="append", default=[], metavar="LOGIN",
+                       help="also exclude review comments from this automation account")
+    draft.add_argument("--output-dir", type=Path, default=Path(".scorecard", "instructions"))
 
     args = parser.parse_args(argv)
     return args.run(args, parser)

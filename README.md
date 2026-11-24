@@ -75,6 +75,20 @@ python scorecard.py assess --retrieve-evidence --publish-data --max-prs 0
 
 The exporter replays Git lookups to verify citations outside the prepared evidence. Published decisions contain thread IDs, finding types, outcomes, duplicate references, and public evidence links. Model explanations and lookup transcripts stay local.
 
+## Draft Copilot review instructions
+
+Use the same Copilot SDK setup as `assess`. Load prepared evidence and run `capture-authors` for the selected window if the archive is missing PR author metadata.
+
+```sh
+python scorecard.py draft-instructions --repo open-telemetry/semantic-conventions-conformance
+```
+
+The command drafts code rules from repository guides and original human findings marked addressed whose cited reviewed and merged snapshots show a change. It reads the public default branch and the local archive without updating either. If there are no paired review examples, it says so and uses repository guides. It considers existing Copilot instructions only after the first draft, as reference material for rules the draft missed.
+
+`.scorecard/instructions/copilot-instructions.patch` is a full replacement against the revision in `copilot-instructions.evidence.json`. The patch updates or removes `.github/copilot-instructions.md` and `.github/instructions/**/*.instructions.md` as needed, and leaves shared files such as `AGENTS.md` alone. The evidence file links each rule to its sources. Inspect the patch before applying it. The generator does not apply or publish it.
+
+The same rules apply to both kinds of review. A checkout audit reports violations anywhere in scope. A pull request review reports only violations the diff introduces.
+
 ## How the agent makes its calls
 
 The classifier sends only the inline thread openers and the IDs, times, and commented paths. It classifies them and links clear duplicates to their originals. If a PR exceeds the input budget, it classifies the openers in batches, then checks the finding summaries for duplicates across the whole PR. The outcome pass examines each original finding separately using public GitHub patches and file snapshots from the reviewed revision, later commits and the merged revision. The program checks that evidence links come from those inputs. One Copilot SDK client handles the run, with a fresh session per request, a task-specific system prompt that replaces the default agent prompt, and no tools. Only public evidence goes to Copilot.

@@ -18,6 +18,7 @@ from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from outcome_evidence import OutcomeEvidence
 from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
+from review_instructions import DISCOVER, FINALIZE, Snapshot, archived_examples, draft_rules, render_rules
 from scorecard import AUTOMATED, BASELINE, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -877,6 +878,122 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual(judge(FakeModel(reply), *args)["status"], "unaddressed")
         records["comparison"]["complete"] = True
         self.assertEqual(judge(FakeModel(reply), *args)["status"], "unaddressed")
+
+
+class InstructionDraftTests(unittest.TestCase):
+    def test_examples_require_an_addressed_human_comment_and_cited_snapshot_pair(self):
+        repo = REPOS[0]
+        base = f"https://github.com/{repo}"
+        day = BASELINE[0].isoformat()
+        threads = [
+            {"id": ident, "opened": f"{day}T08:00:00Z", "url": f"{base}/pull/1#{ident}", "path": "runner.py",
+             "author": {"login": kind.lower(), "__typename": kind}, "body": body}
+            for ident, kind, body in (
+                ("human", "User", "The runner hides the rejected value."),
+                ("bot", "Bot", "The runner hides the rejected value."),
+                ("delegate", "User", "@copilot implement the review feedback."),
+                ("unaddressed", "User", "The runner hides the rejected value."),
+                ("unpaired", "User", "The runner hides the rejected value."),
+            )
+        ]
+        pull = {"repo": repo, "number": 1, "merged": f"{day}T12:00:00Z", "threads": threads}
+        before, after = (f"{base}/blob/{rev * 40}/runner.py" for rev in "ab")
+        bundle = {
+            "version": PREPARED_VERSION, "input": digest(pull),
+            "threads": {t["id"]: {"records": {"reviewed-0": 0, "merged-0": 1}} for t in threads},
+            "records": [
+                {"path": "runner.py", "url": before, "text": "shown = None"},
+                {"path": "runner.py", "url": after, "text": "shown = rejected"},
+            ],
+        }
+        inputs = [RETRIEVAL_VERSION, pull, digest(bundle)]
+        key = judgment_key("model", inputs, "high")
+        result = {
+            "assessment_version": RETRIEVAL_VERSION, "evidence_digest": digest(bundle),
+            "model": "model", "reasoning_effort": "high",
+            "threads": [
+                {"id": t["id"], "kind": "bug",
+                 "status": "unaddressed" if t["id"] == "unaddressed" else "addressed",
+                 "evidence": [before] if t["id"] == "unpaired" else [before, after]}
+                for t in threads
+            ],
+        }
+        with TemporaryDirectory() as work, closing(Archive(Path(work) / "archive.sqlite3")) as archive:
+            with archive.db:
+                archive.db.execute("INSERT INTO pulls VALUES (?, 1, ?, ?, ?)",
+                                   (repo, day, pull["merged"], encode(pull)))
+                archive.db.execute("INSERT INTO pull_authors VALUES (?, 1, 'user', 'User')", (repo,))
+            archive.put_prepared(repo, 1, bundle)
+            archive.put_judgment(repo, 1, "published", key, result)
+            examples, addressed = archived_examples(
+                archive, repo, BASELINE, human=lambda author: identity(author, set(), set()) == "human",
+                bot_pr=lambda login, kind: kind == "Bot",
+            )
+        self.assertEqual(addressed, 3)
+        self.assertEqual(len(examples), 1)
+        self.assertEqual(examples[0]["urls"], [threads[0]["url"], before, after])
+        self.assertEqual(examples[0]["change"], "-shown = None\n+shown = rejected")
+
+    def test_draft_replaces_only_copilot_files_and_reads_them_after_discovery(self):
+        with TemporaryDirectory() as work:
+            root = Path(work)
+            repo = root / "repo"
+            repo.mkdir()
+            git_at(repo, "init", "--quiet")
+            git_at(repo, "config", "user.name", "Draft fixture")
+            git_at(repo, "config", "user.email", "fixture@example.test")
+            originals = {
+                ".github/copilot-instructions.md": "Old global instructions\n",
+                ".github/instructions/old/nested.instructions.md": "Old scoped instructions\n",
+                ".github/instructions/notes.md": "Shared note\n",
+                "AGENTS.md": "Shared agent guide\n" * 250 + "Record observations without declaring expectations.\n",
+                "README.md": "The runner distinguishes rejected attributes from missing ones.\n",
+                "tools/runner/runner.py": "def run(): pass\n",
+            }
+            for path, text in originals.items():
+                file = repo / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(text, encoding="utf-8")
+            git_at(repo, "add", ".")
+            git_at(repo, "commit", "--quiet", "-m", "Create draft fixture")
+            rule = {"scopes": ["tools/runner"], "rule": "Report rejected attributes separately.", "sources": ["D1"]}
+
+            def answer(prompt, data):
+                if prompt == DISCOVER:
+                    self.assertEqual(list(data["sources"]), ["D1"])
+                    return [rule]
+                self.assertTrue(prompt.startswith(FINALIZE))
+                self.assertEqual(data["candidates"], [rule])
+                self.assertEqual({row["text"].strip() for row in data["sources"].values() if row["kind"] == "prior"},
+                                 {"Old global instructions", "Old scoped instructions"})
+                shared = next(row for row in data["sources"].values() if row["path"] == "AGENTS.md")
+                self.assertIn("without declaring expectations", shared["text"])
+                if prompt == FINALIZE:
+                    prior = next(key for key, row in data["sources"].items() if row["kind"] == "prior")
+                    return [dict(rule, sources=[prior])]
+                self.assertIn("lacks independent support", prompt)
+                return [rule, rule]
+
+            model = Mock()
+            model.ask.side_effect = answer
+            snapshot = Snapshot(repo / ".git")
+            rules, sources = draft_rules(model, snapshot, REPOS[0], [])
+            files, evidence = render_rules(rules, sources)
+            patch_bytes, removed = snapshot.replacement(files, root / "draft.index")
+            self.assertEqual(git_at(repo, "status", "--short"), "")
+            self.assertEqual(removed, [".github/instructions/old/nested.instructions.md"])
+            self.assertEqual(len(evidence), 1)
+            patch_file = root / "draft.patch"
+            patch_file.write_bytes(patch_bytes)
+            git_at(repo, "apply", str(patch_file))
+            self.assertFalse((repo / removed[0]).exists())
+            self.assertIn('applyTo: "tools/runner/**"',
+                          (repo / ".github/instructions/tools-runner.instructions.md").read_text(encoding="utf-8"))
+            self.assertIn("only violations introduced by the diff",
+                          (repo / ".github/copilot-instructions.md").read_text(encoding="utf-8"))
+            for path in ("AGENTS.md", ".github/instructions/notes.md", "README.md", "tools/runner/runner.py"):
+                self.assertEqual((repo / path).read_text(encoding="utf-8"), originals[path])
+            self.assertEqual(model.ask.call_count, 3)
 
 
 class ReportTests(unittest.TestCase):
