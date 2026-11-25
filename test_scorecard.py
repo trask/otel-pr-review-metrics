@@ -18,7 +18,8 @@ from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from outcome_evidence import OutcomeEvidence
 from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
-from review_instructions import DISCOVER, FINALIZE, Snapshot, archived_examples, ask_rules, draft_rules, render_rules, validate_rules
+from review_instructions import (DISCOVER, FINALIZE, Snapshot, archived_examples, ask_rules, consolidation_input,
+                                 draft_rules, render_rules, validate_rules)
 from scorecard import AUTOMATED, BASELINE, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -964,7 +965,8 @@ class InstructionDraftTests(unittest.TestCase):
                                  {"Old global instructions", "Old scoped instructions"})
                 shared = next(row for row in data["sources"].values() if row["path"] == "AGENTS.md")
                 self.assertIn("without declaring expectations", shared["text"])
-                candidate = dict(rule, sources=["I1"], marker=None)
+                candidate = dict(rule, sources=["I1"], marker=None, impact="behavior",
+                                 audit_example="A workload embeds assertions and fails before recording a sample.")
                 if prompt == DISCOVER:
                     return [candidate]
                 self.assertTrue(prompt.startswith(FINALIZE))
@@ -1012,7 +1014,8 @@ class InstructionDraftTests(unittest.TestCase):
 
     def test_unlisted_scopes_do_not_discard_other_rules_after_correction(self):
         valid = {"scopes": ["tools"], "rule": "Runners keep diagnostics separate.",
-                 "marker": None, "sources": ["D1"]}
+                 "marker": None, "sources": ["D1"], "impact": "behavior",
+                 "audit_example": "A runner writes diagnostics to stdout and breaks its JSON consumer."}
         invalid = dict(valid, scopes=["tools/*"])
         model = Mock()
         model.ask.side_effect = [[invalid, valid], [invalid, valid]]
@@ -1023,9 +1026,27 @@ class InstructionDraftTests(unittest.TestCase):
 
     def test_invalid_marker_does_not_discard_candidate(self):
         rule = {"scopes": ["tools"], "rule": "Runners keep diagnostics separate.",
-                "sources": ["D1"], "marker": {"kind": "path", "value": "tools/runner"}}
+                "sources": ["D1"], "marker": {"kind": "path", "value": "tools/runner"}, "impact": "behavior",
+                "audit_example": "A runner writes diagnostics to stdout and breaks its JSON consumer."}
         with self.assertLogs(level="WARNING"):
             self.assertEqual(validate_rules([rule], ["tools"], {"D1": {}}), [dict(rule, marker=None)])
+
+    def test_tight_budget_preserves_supported_rules_that_catch_failures(self):
+        sources = {
+            "D1": {"kind": "guide", "text": "Migrations are safe to retry. Migration filenames use lowercase."},
+            "R1": {"kind": "review", "pr": 42, "path": "db/init.sql", "review": "Keep a backup before deleting."},
+        }
+        failure = {"scopes": ["db"], "rule": "Migrations tolerate retries.", "sources": ["D1"], "marker": None,
+                   "impact": "behavior", "audit_example": "A retried backfill inserts duplicate account rows."}
+        convention = dict(failure, rule="Migration filenames use lowercase.", impact="convention",
+                          audit_example="A mixed-case filename differs from its neighbors.")
+        unsupported = dict(failure, rule="Migrations back up dropped tables.", sources=["R1"],
+                           audit_example="A migration drops a table without a backup and rollback loses the data.")
+        data = consolidation_input(["db"], [unsupported, convention, failure], sources,
+                                   input_size(FINALIZE, {"scopes": ["db"], "candidates": [failure],
+                                                         "sources": {"D1": sources["D1"]}}) + 1_000)
+        self.assertEqual(data["candidates"], [failure])
+        self.assertEqual(set(data["sources"]), {"D1"})
 
     def test_promotion_requires_a_current_contract_or_more_than_one_pr(self):
         sources = {
@@ -1080,7 +1101,8 @@ class InstructionDraftTests(unittest.TestCase):
             peer = "C1"
             candidate = {"scopes": ["scenarios/http/js"], "rule": "Declare the HTTP runner in the package.",
                          "sources": ["R1", "R2", peer]}
-            discovery = dict(candidate, marker=None)
+            discovery = dict(candidate, marker=None, impact="behavior",
+                             audit_example="An XHR package picks a database runner and checks the wrong policy.")
             if prompt == DISCOVER:
                 review = sources["R1"]
                 peers = {sources[ref]["path"]: sources[ref]["text"] for ref in review["comparisons"]}
@@ -1131,9 +1153,11 @@ class InstructionDraftTests(unittest.TestCase):
 
             def answer(prompt, data):
                 if prompt == DISCOVER:
+                    candidate = dict(rule, impact="behavior",
+                                     audit_example="An OBI scenario records another runner's spans in a shared collector.")
                     return [
-                        dict(rule, marker={"kind": "path", "value": "obi"}),
-                        dict(rule, marker={"kind": "text", "value": "collector_mode"}),
+                        dict(candidate, marker={"kind": "path", "value": "obi"}),
+                        dict(candidate, marker={"kind": "text", "value": "collector_mode"}),
                     ]
                 self.assertEqual(prompt, FINALIZE)
                 peers = {row["marker"]["kind"]: {data["sources"][ref]["path"]: data["sources"][ref]["text"]

@@ -89,6 +89,8 @@ When first reading a finding, the generator compares the fix with the current fi
 
 Each final rule needs a concrete checkout audit example and either a verified quote from a current repository guide or evidence from at least two independent PRs. Multiple comments on the same PR count once. One-off findings stay out of the instructions.
 
+Discovery asks what each candidate violation would break. When space is limited, the generator prioritizes supported candidates whose violations cause concrete failures over rules that only describe style or layout. It keeps exact interfaces and exceptions when they matter to the review verdict.
+
 `.scorecard/instructions/copilot-instructions.patch` is a full replacement against the revision in `copilot-instructions.evidence.json`. The patch updates or removes `.github/copilot-instructions.md` and `.github/instructions/**/*.instructions.md` as needed, and leaves shared files such as `AGENTS.md` alone. The evidence file links each rule to its sources. Inspect the patch before applying it. The generator does not apply or publish it.
 
 Generated rules describe what must hold in the current code, regardless of what changed. The patch includes a repository-wide instruction file only when there are repository-wide rules.
