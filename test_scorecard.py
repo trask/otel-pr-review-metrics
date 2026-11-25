@@ -1021,6 +1021,12 @@ class InstructionDraftTests(unittest.TestCase):
         self.assertIn("tools/*", logs.output[0])
         self.assertIn("tools/*", model.ask.call_args.args[0])
 
+    def test_invalid_marker_does_not_discard_candidate(self):
+        rule = {"scopes": ["tools"], "rule": "Runners keep diagnostics separate.",
+                "sources": ["D1"], "marker": {"kind": "path", "value": "tools/runner"}}
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(validate_rules([rule], ["tools"], {"D1": {}}), [dict(rule, marker=None)])
+
     def test_promotion_requires_a_current_contract_or_more_than_one_pr(self):
         sources = {
             "D1": {"kind": "guide", "text": "Shared scenarios have no\n instrumentation setup."},
