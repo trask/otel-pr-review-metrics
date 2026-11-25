@@ -83,13 +83,15 @@ Use the same Copilot SDK setup as `assess`. Load prepared evidence and run `capt
 python scorecard.py draft-instructions --repo open-telemetry/semantic-conventions-conformance
 ```
 
-The command drafts code rules from repository guides and original human findings marked addressed whose cited reviewed and merged snapshots show a change. It reads the public default branch and the local archive without updating either. If there are no paired review examples, it says so and uses repository guides. It considers existing Copilot instructions only after the first draft, as reference material for rules the draft missed.
+The command drafts code rules from current repository guides, including `AGENTS.md`, and original human findings marked addressed whose cited reviewed and merged snapshots show a change. It reads the public default branch and the local archive without updating either. Existing Copilot instructions can suggest rules during discovery, but they do not count as evidence or determine the wording, scope, or layout of the replacement.
+
+When first reading a finding, the generator compares the fix with the current file and excerpts from comparable files at different levels of the repository. It also looks for literal path or code markers for candidate rules and samples matching files across the checkout before finalizing scope. Matching names are leads, not proof that the same rule applies. The draft describes the required behavior without prescribing the patch's implementation and keeps meaningful exceptions.
 
 Each final rule needs a concrete checkout audit example and either a verified quote from a current repository guide or evidence from at least two independent PRs. Multiple comments on the same PR count once. One-off findings stay out of the instructions.
 
 `.scorecard/instructions/copilot-instructions.patch` is a full replacement against the revision in `copilot-instructions.evidence.json`. The patch updates or removes `.github/copilot-instructions.md` and `.github/instructions/**/*.instructions.md` as needed, and leaves shared files such as `AGENTS.md` alone. The evidence file links each rule to its sources. Inspect the patch before applying it. The generator does not apply or publish it.
 
-The same rules apply to both kinds of review. A checkout audit reports violations anywhere in scope. A pull request review reports only violations the diff introduces.
+Generated rules describe what must hold in the current code, regardless of what changed. The patch includes a repository-wide instruction file only when there are repository-wide rules.
 
 ## How the agent makes its calls
 

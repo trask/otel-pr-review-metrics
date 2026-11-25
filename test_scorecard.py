@@ -934,7 +934,7 @@ class InstructionDraftTests(unittest.TestCase):
         self.assertEqual(examples[0]["urls"], [threads[0]["url"], before, after])
         self.assertEqual(examples[0]["change"], "-shown = None\n+shown = rejected")
 
-    def test_draft_replaces_only_copilot_files_and_reads_them_after_discovery(self):
+    def test_discovery_reads_guides_and_prior_instructions_but_replaces_only_copilot_files(self):
         with TemporaryDirectory() as work:
             root = Path(work)
             repo = root / "repo"
@@ -956,23 +956,24 @@ class InstructionDraftTests(unittest.TestCase):
                 file.write_text(text, encoding="utf-8")
             git_at(repo, "add", ".")
             git_at(repo, "commit", "--quiet", "-m", "Create draft fixture")
-            rule = {"scopes": ["tools/runner"], "rule": "Report rejected attributes separately.", "sources": ["D1"]}
+            rule = {"scopes": ["tools/runner"], "rule": "Record observations without declaring expectations.",
+                    "sources": ["D1"]}
 
             def answer(prompt, data):
-                if prompt == DISCOVER:
-                    self.assertEqual(list(data["sources"]), ["D1"])
-                    return [rule]
-                self.assertTrue(prompt.startswith(FINALIZE))
-                self.assertEqual(data["candidates"], [rule])
                 self.assertEqual({row["text"].strip() for row in data["sources"].values() if row["kind"] == "prior"},
                                  {"Old global instructions", "Old scoped instructions"})
                 shared = next(row for row in data["sources"].values() if row["path"] == "AGENTS.md")
                 self.assertIn("without declaring expectations", shared["text"])
+                candidate = dict(rule, sources=["I1"], marker=None)
+                if prompt == DISCOVER:
+                    return [candidate]
+                self.assertTrue(prompt.startswith(FINALIZE))
+                self.assertEqual(data["candidates"], [dict(candidate, marker_comparisons=[])])
                 if prompt == FINALIZE:
                     return [rule]
                 self.assertIn("audit_example", prompt)
-                promoted = dict(rule, audit_example="A YAML check presents a rejected value as missing.",
-                                contract={"source": "D1", "quote": originals["README.md"].strip()})
+                promoted = dict(rule, audit_example="A workload embeds assertions and fails before recording a sample.",
+                                contract={"source": "D1", "quote": originals["AGENTS.md"].splitlines()[-1]})
                 return [promoted, promoted]
 
             model = Mock()
@@ -982,45 +983,154 @@ class InstructionDraftTests(unittest.TestCase):
             files, evidence = render_rules(rules, sources)
             patch_bytes, removed = snapshot.replacement(files, root / "draft.index")
             self.assertEqual(git_at(repo, "status", "--short"), "")
-            self.assertEqual(removed, [".github/instructions/old/nested.instructions.md"])
+            self.assertEqual(removed, [
+                ".github/copilot-instructions.md",
+                ".github/instructions/old/nested.instructions.md",
+            ])
             self.assertEqual(len(evidence), 1)
-            self.assertEqual(evidence[0]["contract"]["quote"], originals["README.md"].strip())
+            self.assertEqual(evidence[0]["contract"]["quote"], originals["AGENTS.md"].splitlines()[-1])
             patch_file = root / "draft.patch"
             patch_file.write_bytes(patch_bytes)
             git_at(repo, "apply", str(patch_file))
-            self.assertFalse((repo / removed[0]).exists())
+            for path in removed:
+                self.assertFalse((repo / path).exists())
             self.assertIn('applyTo: "tools/runner/**"',
                           (repo / ".github/instructions/tools-runner.instructions.md").read_text(encoding="utf-8"))
-            self.assertIn("only violations introduced by the diff",
-                          (repo / ".github/copilot-instructions.md").read_text(encoding="utf-8"))
             for path in ("AGENTS.md", ".github/instructions/notes.md", "README.md", "tools/runner/runner.py"):
                 self.assertEqual((repo / path).read_text(encoding="utf-8"), originals[path])
             self.assertEqual(model.ask.call_count, 3)
+
+    def test_repository_wide_instructions_contain_only_code_rules(self):
+        files, _ = render_rules([{
+            "scopes": [], "rule": "Shared workloads do not initialize telemetry.",
+            "sources": ["D1"], "contract": None,
+        }], {"D1": {"kind": "guide", "path": "README.md", "urls": ["https://example.test/README.md"]}})
+        self.assertEqual(files, {
+            ".github/copilot-instructions.md": "# Repository code rules\n\n"
+            "- Shared workloads do not initialize telemetry.\n",
+        })
 
     def test_promotion_requires_a_current_contract_or_more_than_one_pr(self):
         sources = {
             "D1": {"kind": "guide", "text": "Shared scenarios have no\n instrumentation setup."},
             "I1": {"kind": "prior", "text": "Shared scenarios have no instrumentation setup."},
-            "R1": {"kind": "review", "pr": 42},
-            "R2": {"kind": "review", "pr": 42},
-            "R3": {"kind": "review", "pr": 65},
+            "R1": {"kind": "review", "pr": 42, "path": "scenarios/http/java/Server.java"},
+            "R2": {"kind": "review", "pr": 42, "path": "scenarios/http/js/server.js"},
+            "R3": {"kind": "review", "pr": 65, "path": "scenarios/http/js/server.js"},
+            "C1": {"kind": "comparison", "path": "scenarios/database/java/Server.java"},
         }
         rule = {"scopes": ["scenarios"], "rule": "Shared scenarios are instrumented externally.",
                 "audit_example": "A Redis workload starts a telemetry provider and reports its own spans."}
         guide = dict(rule, sources=["D1"], contract={"source": "D1", "quote":
                      "Shared scenarios have no instrumentation setup."})
-        independent = dict(rule, sources=["R1", "R3"], contract=None)
+        independent = dict(rule, sources=["R1", "R3"], contract=None, scopes=["scenarios/http"])
+        wider = dict(independent, scopes=["scenarios"])
+        compared = dict(wider, sources=["C1", "R1", "R3"])
         with self.assertLogs(level="WARNING") as logs:
             promoted = validate_rules([
                 guide,
                 dict(guide, contract={"source": "D1", "quote": "Invented contract."}),
                 dict(guide, sources=["I1"], contract={"source": "I1", "quote": guide["contract"]["quote"]}),
+                dict(guide, sources=["D1", "I1"]),
                 dict(rule, sources=["D1", "R1", "R2"], contract=None),
                 independent,
+                wider,
+                compared,
                 dict(independent, audit_example=""),
-            ], ["scenarios"], sources, final=True)
-        self.assertEqual(promoted, [guide, independent])
-        self.assertEqual(len(logs.output), 4)
+            ], ["scenarios", "scenarios/http"], sources, final=True)
+        self.assertEqual(promoted, [guide, independent, compared])
+        self.assertEqual(len(logs.output), 6)
+
+    def test_discovery_sees_current_neighbors_and_sibling_components_before_choosing_scope(self):
+        path = "scenarios/http/js/fetch/native/conformance.yaml"
+        files = {
+            path: "runner: http\nrun: launch fetch",
+            "scenarios/http/js/xhr/native/conformance.yaml": "runner: http\nrun: launch xhr",
+            "scenarios/http/java/client/native/conformance.yaml": "runner: http\nrun: launch gradle",
+            "scenarios/database/java/client/native/conformance.yaml": "runner: database\nsetup: prepare backend",
+            "scenarios/database/java/unrelated/README.md": "Unrelated guide.",
+        }
+        snapshot = SimpleNamespace(
+            entries={p: ("100644", "a" * 40, len(text)) for p, text in files.items()}, revision="b" * 40,
+            read=lambda paths: {p: files[p] for p in paths},
+        )
+        reviews = [dict(path=path, review="Keep HTTP instrumentation out of the workload.",
+                        change="-runner: internal\n+runner: http", urls=[], pr=number)
+                   for number in (42, 65)]
+
+        def answer(prompt, data):
+            sources = data["sources"]
+            review = sources["R1"]
+            peers = {sources[ref]["path"]: sources[ref]["text"] for ref in review["comparisons"]}
+            self.assertEqual(peers, {p: text for p, text in files.items()
+                                     if p != path and p.endswith("/conformance.yaml")})
+            candidate = {"scopes": ["scenarios/http/js"], "rule": "Declare the HTTP runner in the package.",
+                         "sources": ["R1", "R2", review["comparisons"][0]]}
+            discovery = dict(candidate, marker=None)
+            if prompt == DISCOVER:
+                self.assertEqual(review["current"], files[path])
+                self.assertIn("scenarios/http/js/fetch/native", data["scopes"])
+                return [discovery]
+            self.assertEqual(prompt, FINALIZE)
+            self.assertEqual(data["candidates"], [
+                dict(discovery, sources=sorted(candidate["sources"]), marker_comparisons=[]),
+            ])
+            return [dict(candidate, audit_example="An XHR package picks a database runner and checks the wrong policy.",
+                         contract=None)]
+
+        model = Mock()
+        model.ask.side_effect = answer
+        rules, sources = draft_rules(model, snapshot, REPOS[0], reviews)
+        _, evidence = render_rules(rules, sources)
+        self.assertEqual([row["scopes"] for row in evidence], [["scenarios/http/js"]])
+        self.assertIn("scenarios/http/js/xhr/native/conformance.yaml",
+                      {source["path"] for source in evidence[0]["sources"]})
+
+    def test_literal_markers_find_current_code_across_directories(self):
+        with TemporaryDirectory() as work:
+            repo = Path(work)
+            git_at(repo, "init", "--quiet")
+            git_at(repo, "config", "user.name", "Draft fixture")
+            git_at(repo, "config", "user.email", "fixture@example.test")
+            files = {
+                "README.md": ("Background on the runner.\n\n" * 170
+                              + "Each external runner uses a separate collector.\n"),
+                "scenarios/go/obi/scenario.yaml": "collector: separate\n",
+                "scenarios/java/obi/setup.json": '{"collector": "separate"}\n',
+                "scenarios/go/mobi/scenario.yaml": "collector: shared\n",
+                "tools/python/settings.py": "# padding\n" * 100 + "COLLECTOR_MODE = 'separate'\n",
+                "tools/ruby/runner.rb": "collector_mode = 'shared'\n",
+            }
+            for path, text in files.items():
+                file = repo / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(text, encoding="utf-8")
+            git_at(repo, "add", ".")
+            git_at(repo, "commit", "--quiet", "-m", "Create scope fixture")
+            rule = {"scopes": ["scenarios"], "rule": "External runners use a separate collector.", "sources": ["D1"]}
+
+            def answer(prompt, data):
+                if prompt == DISCOVER:
+                    return [
+                        dict(rule, marker={"kind": "path", "value": "obi"}),
+                        dict(rule, marker={"kind": "text", "value": "collector_mode"}),
+                    ]
+                self.assertEqual(prompt, FINALIZE)
+                peers = {row["marker"]["kind"]: {data["sources"][ref]["path"]: data["sources"][ref]["text"]
+                                                for ref in row["marker_comparisons"]}
+                         for row in data["candidates"]}
+                self.assertEqual(set(peers["path"]), {"scenarios/go/obi/scenario.yaml", "scenarios/java/obi/setup.json"})
+                self.assertEqual(set(peers["text"]), {"tools/python/settings.py", "tools/ruby/runner.rb"})
+                self.assertIn("COLLECTOR_MODE", peers["text"]["tools/python/settings.py"])
+                self.assertIn("scenarios/java/obi", data["scopes"])
+                return [dict(rule, scopes=["scenarios/go/obi", "scenarios/java/obi"],
+                             audit_example="An OBI scenario records another runner's spans in a shared collector.",
+                             contract={"source": "D1", "quote": files["README.md"].splitlines()[-1]})]
+
+            model = Mock()
+            model.ask.side_effect = answer
+            rules, _ = draft_rules(model, Snapshot(repo / ".git"), REPOS[0], [])
+            self.assertEqual(rules[0]["scopes"], ["scenarios/go/obi", "scenarios/java/obi"])
 
 
 class ReportTests(unittest.TestCase):
