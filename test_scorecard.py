@@ -1077,18 +1077,21 @@ class InstructionDraftTests(unittest.TestCase):
 
         def answer(prompt, data):
             sources = data["sources"]
-            review = sources["R1"]
-            peers = {sources[ref]["path"]: sources[ref]["text"] for ref in review["comparisons"]}
-            self.assertEqual(peers, {p: text for p, text in files.items()
-                                     if p != path and p.endswith("/conformance.yaml")})
+            peer = "C1"
             candidate = {"scopes": ["scenarios/http/js"], "rule": "Declare the HTTP runner in the package.",
-                         "sources": ["R1", "R2", review["comparisons"][0]]}
+                         "sources": ["R1", "R2", peer]}
             discovery = dict(candidate, marker=None)
             if prompt == DISCOVER:
+                review = sources["R1"]
+                peers = {sources[ref]["path"]: sources[ref]["text"] for ref in review["comparisons"]}
+                self.assertEqual(peers, {p: text for p, text in files.items()
+                                         if p != path and p.endswith("/conformance.yaml")})
+                self.assertEqual(review["comparisons"][0], peer)
                 self.assertEqual(review["current"], files[path])
                 self.assertIn("scenarios/http/js/fetch/native", data["scopes"])
                 return [discovery]
             self.assertEqual(prompt, FINALIZE)
+            self.assertEqual(sources[peer]["path"], "scenarios/http/js/xhr/native/conformance.yaml")
             self.assertEqual(data["candidates"], [
                 dict(discovery, sources=sorted(candidate["sources"]), marker_comparisons=[]),
             ])

@@ -590,20 +590,42 @@ def draft_rules(model, snapshot, repo, examples):
     inspected = {source["path"] for source in sources.values() if source["kind"] != "prior"}
     scopes = known_scopes(snapshot.entries, inspected)
     candidates = merge_identical(discover_rules(model, scopes, sources))
-    add_marker_comparisons(snapshot, repo, candidates, sources)
-    cited = {ref for row in candidates for ref in row["sources"]}
-    comparisons = {peer for ref in cited if sources[ref]["kind"] == "review"
-                   for peer in sources[ref]["comparisons"]}
     summary = {}
     for key, source in sources.items():
-        if source["kind"] in {"guide", "prior"} or key in comparisons or (
-            source["kind"] == "comparison" and key in cited
-        ):
+        if source["kind"] in {"guide", "prior"}:
             summary[key] = {k: v for k, v in source.items() if k != "urls"}
-        elif key in cited:
-            summary[key] = {k: source[k] for k in ("kind", "path", "pr", "comparisons")}
-            summary[key]["review"] = bounded(source["review"], 300)
-    data = {"scopes": scopes, "candidates": candidates, "sources": summary}
+    selected = []
+    data = {"scopes": scopes, "candidates": selected, "sources": summary}
+    limit = max(MAX_INPUT * 4 // 5, input_size(FINALIZE, data) + 10_000)
+
+    def priority(row):
+        cited = [sources[ref] for ref in row["sources"]]
+        pulls = {source["pr"] for source in cited if source["kind"] == "review"}
+        return not (len(pulls) >= 2 or any(source["kind"] == "guide" for source in cited))
+
+    for row in sorted(candidates, key=priority):
+        added = []
+        for ref in row["sources"]:
+            if ref in summary:
+                continue
+            source = sources[ref]
+            if source["kind"] == "review":
+                summary[ref] = {k: source[k] for k in ("kind", "path", "pr")}
+                summary[ref]["review"] = bounded(source["review"], 300)
+            else:
+                summary[ref] = {k: v for k, v in source.items() if k != "urls"}
+            added.append(ref)
+        selected.append(row)
+        if input_size(FINALIZE, data) > limit:
+            selected.pop()
+            for ref in added:
+                del summary[ref]
+    if candidates and not selected:
+        raise DataError("No candidate rule fits the consolidation input budget")
+    if len(selected) < len(candidates):
+        logging.info("Consolidating %d of %d candidates within the input budget", len(selected), len(candidates))
+    candidates = selected
+    add_marker_comparisons(snapshot, repo, candidates, sources)
     marker_groups = [row.pop("marker_comparisons") for row in candidates]
     for row in candidates:
         row["marker_comparisons"] = []
