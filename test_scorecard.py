@@ -18,7 +18,7 @@ from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from outcome_evidence import OutcomeEvidence
 from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
-from review_instructions import DISCOVER, FINALIZE, Snapshot, archived_examples, draft_rules, render_rules, validate_rules
+from review_instructions import DISCOVER, FINALIZE, Snapshot, archived_examples, ask_rules, draft_rules, render_rules, validate_rules
 from scorecard import AUTOMATED, BASELINE, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -1009,6 +1009,17 @@ class InstructionDraftTests(unittest.TestCase):
             ".github/copilot-instructions.md": "# Repository code rules\n\n"
             "- Shared workloads do not initialize telemetry.\n",
         })
+
+    def test_unlisted_scopes_do_not_discard_other_rules_after_correction(self):
+        valid = {"scopes": ["tools"], "rule": "Runners keep diagnostics separate.",
+                 "marker": None, "sources": ["D1"]}
+        invalid = dict(valid, scopes=["tools/*"])
+        model = Mock()
+        model.ask.side_effect = [[invalid, valid], [invalid, valid]]
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(ask_rules(model, DISCOVER, {"scopes": ["tools"], "sources": {"D1": {}}}), [valid])
+        self.assertIn("tools/*", logs.output[0])
+        self.assertIn("tools/*", model.ask.call_args.args[0])
 
     def test_promotion_requires_a_current_contract_or_more_than_one_pr(self):
         sources = {
