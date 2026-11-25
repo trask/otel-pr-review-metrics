@@ -18,8 +18,9 @@ from github_data import DataError, GitHub, RateLimitError, run_command
 from git_evidence import GitEvidence
 from outcome_evidence import OutcomeEvidence
 from prepared import PREPARED_VERSION, Evidence, PreparedEvidence, digest, pack_changes, prepare
-from review_instructions import (DISCOVER, FINALIZE, Snapshot, archived_examples, ask_rules, consolidation_input,
-                                 draft_rules, render_rules, validate_rules)
+from review_instructions import (AUTHORING_INSTRUCTIONS, DISCOVER, EDIT_DRAFT, FINALIZE, JUDGE_EDITS, Snapshot,
+                                 archived_examples, ask_rules, consolidation_input, draft_rules, refine_rules,
+                                 render_rules, validate_rules)
 from scorecard import AUTOMATED, BASELINE, REPOS, Cohort, Stats, assess_cached, assessment_order, identity, main, render
 from shared_data import SharedData, judgment_key, public_assessment
 
@@ -840,6 +841,21 @@ class AssessmentTests(unittest.TestCase):
             session.disconnect.assert_awaited_once()
         client.stop.assert_awaited_once()
 
+    @unittest.skipIf(sys.version_info < (3, 11), "SDK requires Python 3.11")
+    def test_sdk_gives_max_reasoning_more_time_and_reports_timeouts(self):
+        session = AsyncMock()
+        session.send_and_wait.side_effect = TimeoutError
+        client = Mock(create_session=AsyncMock(return_value=session), stop=AsyncMock())
+        sdk = SimpleNamespace(CopilotClient=Mock(return_value=client), JsonRpcError=RuntimeError)
+        with patch.dict("sys.modules", {"copilot": sdk}), patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": "test"}):
+            with closing(Copilot("model", "max")) as model:
+                with self.assertRaisesRegex(AssessmentError, r"model \(max\) timed out after"):
+                    model.ask(CLASSIFY, {})
+        self.assertEqual(client.create_session.await_args.kwargs["reasoning_effort"], "max")
+        self.assertGreater(session.send_and_wait.await_args.kwargs["timeout"], 180)
+        session.abort.assert_awaited_once()
+        session.disconnect.assert_awaited_once()
+
     def test_judge_preserves_core_evidence_when_dropping_optional_context(self):
         records = {
             "reviewed-0": {"url": "reviewed", "state": "text", "path": "a"},
@@ -946,6 +962,7 @@ class InstructionDraftTests(unittest.TestCase):
             originals = {
                 ".github/copilot-instructions.md": "Old global instructions\n",
                 ".github/instructions/old/nested.instructions.md": "Old scoped instructions\n",
+                AUTHORING_INSTRUCTIONS: "Old authoring instructions\n",
                 ".github/instructions/notes.md": "Shared note\n",
                 "AGENTS.md": "Shared agent guide\n" * 250 + "Record observations without declaring expectations.\n",
                 "README.md": "The runner distinguishes rejected attributes from missing ones.\n",
@@ -961,6 +978,8 @@ class InstructionDraftTests(unittest.TestCase):
                     "sources": ["D1"]}
 
             def answer(prompt, data):
+                if prompt == EDIT_DRAFT:
+                    return []
                 self.assertEqual({row["text"].strip() for row in data["sources"].values() if row["kind"] == "prior"},
                                  {"Old global instructions", "Old scoped instructions"})
                 shared = next(row for row in data["sources"].values() if row["path"] == "AGENTS.md")
@@ -998,19 +1017,61 @@ class InstructionDraftTests(unittest.TestCase):
                 self.assertFalse((repo / path).exists())
             self.assertIn('applyTo: "tools/runner/**"',
                           (repo / ".github/instructions/tools-runner.instructions.md").read_text(encoding="utf-8"))
+            authoring = (repo / AUTHORING_INSTRUCTIONS).read_text(encoding="utf-8")
+            self.assertEqual(authoring, files[AUTHORING_INSTRUCTIONS])
+            self.assertTrue(authoring.startswith(
+                '---\napplyTo: ".github/copilot-instructions.md,.github/instructions/**/*.instructions.md"\n'
+                '---\n\n# Writing repository instructions\n',
+            ))
+            self.assertNotIn("Old authoring instructions", authoring)
             for path in ("AGENTS.md", ".github/instructions/notes.md", "README.md", "tools/runner/runner.py"):
                 self.assertEqual((repo / path).read_text(encoding="utf-8"), originals[path])
-            self.assertEqual(model.ask.call_count, 3)
+            self.assertEqual(model.ask.call_count, 4)
+            git_at(repo, "add", ".")
+            git_at(repo, "commit", "--quiet", "-m", "Apply replacement")
+            self.assertEqual(Snapshot(repo / ".git").replacement(files, root / "draft.index"), (b"", []))
 
     def test_repository_wide_instructions_contain_only_code_rules(self):
-        files, _ = render_rules([{
+        files, evidence = render_rules([{
             "scopes": [], "rule": "Shared workloads do not initialize telemetry.",
             "sources": ["D1"], "contract": None,
         }], {"D1": {"kind": "guide", "path": "README.md", "urls": ["https://example.test/README.md"]}})
-        self.assertEqual(files, {
-            ".github/copilot-instructions.md": "# Repository code rules\n\n"
+        self.assertEqual(set(files), {".github/copilot-instructions.md", AUTHORING_INSTRUCTIONS})
+        self.assertEqual([row["file"] for row in evidence], [".github/copilot-instructions.md"])
+        self.assertEqual(
+            files[".github/copilot-instructions.md"],
+            "# Repository code rules\n\n"
             "- Shared workloads do not initialize telemetry.\n",
-        })
+        )
+
+    def test_multiline_rule_keeps_examples_inside_one_bullet_without_overwriting_authoring_guide(self):
+        sources = {"D1": {
+            "kind": "guide", "path": "README.md", "text": "A script that writes results keeps stdout machine-readable.",
+            "urls": ["https://example.test/README.md"],
+        }}
+        rule = {
+            "scopes": ["instruction/authoring"],
+            "rule": "A script that writes results keeps stdout machine-readable.\n\n"
+                    "For example, this command puts diagnostics on stderr:\n\n"
+                    "```sh\nif ! validate; then\n  echo 'invalid  input' >&2\nfi\n```",
+            "sources": ["D1"],
+            "contract": {"source": "D1", "quote": sources["D1"]["text"]},
+            "audit_example": "A validation script prints a warning to stdout and breaks its JSON consumer.",
+        }
+        self.assertEqual(validate_rules([rule], rule["scopes"], sources, final=True), [rule])
+        files, evidence = render_rules([rule], sources)
+        code_path = evidence[0]["file"]
+        self.assertNotEqual(code_path, AUTHORING_INSTRUCTIONS)
+        self.assertEqual(set(files), {AUTHORING_INSTRUCTIONS, code_path})
+        self.assertEqual(files[code_path], (
+            '---\napplyTo: "instruction/authoring/**"\n---\n\n'
+            "# Code rules for instruction/authoring\n\n"
+            "- A script that writes results keeps stdout machine-readable.\n\n"
+            "  For example, this command puts diagnostics on stderr:\n\n"
+            "  ```sh\n  if ! validate; then\n    echo 'invalid  input' >&2\n  fi\n  ```\n"
+        ))
+        with self.assertRaisesRegex(DataError, "must start with prose"):
+            validate_rules([dict(rule, rule="- " + rule["rule"])], rule["scopes"], sources, final=True)
 
     def test_unlisted_scopes_do_not_discard_other_rules_after_correction(self):
         valid = {"scopes": ["tools"], "rule": "Runners keep diagnostics separate.",
@@ -1097,6 +1158,8 @@ class InstructionDraftTests(unittest.TestCase):
                    for number in (42, 65)]
 
         def answer(prompt, data):
+            if prompt == EDIT_DRAFT:
+                return []
             sources = data["sources"]
             peer = "C1"
             candidate = {"scopes": ["scenarios/http/js"], "rule": "Declare the HTTP runner in the package.",
@@ -1152,6 +1215,8 @@ class InstructionDraftTests(unittest.TestCase):
             rule = {"scopes": ["scenarios"], "rule": "External runners use a separate collector.", "sources": ["D1"]}
 
             def answer(prompt, data):
+                if prompt == EDIT_DRAFT:
+                    return []
                 if prompt == DISCOVER:
                     candidate = dict(rule, impact="behavior",
                                      audit_example="An OBI scenario records another runner's spans in a shared collector.")
@@ -1175,6 +1240,70 @@ class InstructionDraftTests(unittest.TestCase):
             model.ask.side_effect = answer
             rules, _ = draft_rules(model, Snapshot(repo / ".git"), REPOS[0], [])
             self.assertEqual(rules[0]["scopes"], ["scenarios/go/obi", "scenarios/java/obi"])
+
+    def test_post_draft_edits_reopen_guides_and_keep_untouched_rules(self):
+        line = "The worker defers a retry by the delay in `Retry-After` when the server sends it."
+        addition_line = "A malformed delay falls back to the configured backoff instead of dropping the job."
+        guide = "Workers rate-limit their requests.\n\n" + "Background on scheduling.\n\n" * 170
+        snapshot = SimpleNamespace(read=lambda paths: {
+            path: guide + line + "\n\n" + addition_line for path in paths
+        })
+        base = {"scopes": ["workers"], "rule": "Workers respect retry delays.", "sources": ["D1"],
+                "audit_example": "An immediate retry exhausts the remaining request quota.",
+                "contract": {"source": "D1", "quote": "Workers rate-limit their requests."}}
+        untouched = dict(base, rule="Workers rate-limit their requests.")
+        refined = dict(base, rule=line, contract={"source": "D1", "quote": line})
+        added = dict(base, rule=addition_line, contract={"source": "D1", "quote": addition_line})
+        unsupported = dict(base, rule="Requests retry forever.", contract=None)
+        data = {"scopes": ["workers"], "sources": {
+            "D1": {"kind": "guide", "path": "workers/README.md", "text": guide[:100]},
+        }}
+
+        def answer(prompt, payload):
+            self.assertEqual(prompt, EDIT_DRAFT)
+            self.assertIn(line, payload["sources"]["D1"]["text"])
+            self.assertEqual(payload["draft"], {"F1": base, "F2": untouched})
+            return [
+                {"target": "F1", "replacement": refined},
+                {"target": "F2", "replacement": dict(refined, rule="All requests defer retries.", scopes=[])},
+                {"target": None, "replacement": unsupported},
+                {"target": None, "replacement": added},
+            ]
+
+        with self.assertLogs(level="WARNING") as logs:
+            rules = refine_rules(Mock(ask=answer), snapshot, [base, untouched], data)
+        self.assertEqual(rules, [refined, untouched, added])
+        self.assertIn("changes rule scope", logs.output[0])
+        self.assertIn("at least two PRs", logs.output[1])
+
+    def test_second_model_proposals_are_judged_before_merging(self):
+        quote = "Retry delays use Retry-After when provided."
+        fallback = "Workers use configured backoff when the delay cannot be parsed."
+        base = {"scopes": ["workers"], "rule": "Workers respect retry delays.", "sources": ["D1"],
+                "audit_example": "An early retry exhausts the remaining request quota.",
+                "contract": {"source": "D1", "quote": quote}}
+        extra = dict(base, rule=fallback, contract={"source": "D1", "quote": fallback})
+        proposed = dict(base, rule="Every worker retry uses Retry-After.")
+        corrected = dict(base, rule=quote)
+        data = {"scopes": ["workers"], "sources": {
+            "D1": {"kind": "guide", "path": "workers/README.md", "text": quote + "\n\n" + fallback},
+        }}
+        snapshot = SimpleNamespace(read=lambda paths: {})
+        editor = Mock()
+        editor.ask.return_value = [{"target": "F1", "replacement": proposed},
+                                   {"target": None, "replacement": extra}]
+
+        def judge(prompt, payload):
+            self.assertEqual(prompt, JUDGE_EDITS)
+            self.assertEqual(payload["proposals"]["P1"]["replacement"], proposed)
+            return [{"proposal": "P1", "replacement": corrected},
+                    {"proposal": "P2", "replacement": dict(extra, scopes=[])}]
+
+        with self.assertLogs(level="WARNING") as logs:
+            result = refine_rules(Mock(ask=judge), snapshot, [base], data, editor=editor)
+        self.assertEqual(result, [corrected])
+        self.assertEqual(editor.ask.call_args.args[0], EDIT_DRAFT)
+        self.assertIn("widens a proposed addition", logs.output[0])
 
 
 class ReportTests(unittest.TestCase):

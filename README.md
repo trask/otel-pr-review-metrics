@@ -91,9 +91,13 @@ Each final rule needs a concrete checkout audit example and either a verified qu
 
 Discovery asks what each candidate violation would break. When space is limited, the generator prioritizes supported candidates whose violations cause concrete failures over rules that only describe style or layout. It keeps exact interfaces and exceptions when they matter to the review verdict.
 
-`.scorecard/instructions/copilot-instructions.patch` is a full replacement against the revision in `copilot-instructions.evidence.json`. The patch updates or removes `.github/copilot-instructions.md` and `.github/instructions/**/*.instructions.md` as needed, and leaves shared files such as `AGENTS.md` alone. The evidence file links each rule to its sources. Inspect the patch before applying it. The generator does not apply or publish it.
+After drafting, a separate editing pass reopens current guides, starting with those closest to the drafted rules. It can restore details that change the review verdict or add a few distinct, evidence-backed rules. It keeps the rest of the draft in place and does not change the scope of an existing rule.
 
-Generated rules describe what must hold in the current code, regardless of what changed. The patch includes a repository-wide instruction file only when there are repository-wide rules.
+To have a second model propose edits, pass `--editor-model claude-opus-5.5 --editor-reasoning-effort high`. The draft model checks those proposals against the evidence before applying them. Select its settings separately with, for example, `--model gpt-6.2-sol --reasoning-effort max`.
+
+`.scorecard/instructions/copilot-instructions.patch` is a full replacement against the revision in `copilot-instructions.evidence.json`. The patch updates or removes `.github/copilot-instructions.md` and `.github/instructions/**/*.instructions.md` as needed, and leaves shared files such as `AGENTS.md` alone. The evidence file links each drafted rule to its sources. Inspect the patch before applying it. The generator does not apply or publish it.
+
+Every replacement includes the [bundled authoring guide](templates/instruction-authoring.instructions.md) at `.github/instructions/instruction-authoring.instructions.md`. It applies only to Copilot instruction files and is not counted as a drafted rule. Drafted rules describe what must hold in the current checkout, regardless of what changed. Each independently fixable requirement gets one bullet, with its conditions, exceptions, and any examples kept inside it. The patch includes `.github/copilot-instructions.md` only when there are repository-wide rules.
 
 ## How the agent makes its calls
 

@@ -603,6 +603,9 @@ def draft_instructions(args, parser):
     dates = tuple(args.window)
     if dates[0] > dates[1]:
         parser.error("window dates must be in order")
+    if args.editor_reasoning_effort and not args.editor_model:
+        parser.error("--editor-reasoning-effort requires --editor-model")
+    editor_effort = args.editor_reasoning_effort or DEFAULT_REASONING_EFFORT
     repo = args.repo.lower()
     try:
         if not args.archive.is_file():
@@ -620,7 +623,11 @@ def draft_instructions(args, parser):
             root = Path(work)
             snapshot = Snapshot.fetch(repo, root / "repository.git")
             with closing(Copilot(args.model, args.reasoning_effort)) as model:
-                rules, sources = draft_rules(model, snapshot, repo, examples)
+                if args.editor_model:
+                    with closing(Copilot(args.editor_model, editor_effort)) as editor:
+                        rules, sources = draft_rules(model, snapshot, repo, examples, editor=editor)
+                else:
+                    rules, sources = draft_rules(model, snapshot, repo, examples)
             files, evidence = render_rules(rules, sources)
             patch, removed = snapshot.replacement(files, root / "draft.index")
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -629,6 +636,8 @@ def draft_instructions(args, parser):
         write_atomic(args.output_dir / "copilot-instructions.evidence.json", json.dumps({
             "repo": repo, "revision": snapshot.revision, "window": [day.isoformat() for day in dates],
             "model": args.model, "reasoning_effort": args.reasoning_effort,
+            **({"editor_model": args.editor_model, "editor_reasoning_effort": editor_effort}
+               if args.editor_model else {}),
             "paired_examples": len(examples), "addressed_findings": addressed,
             "removed_files": removed, "draft_files": sorted(files), "rules": evidence,
         }, ensure_ascii=False, indent=2) + "\n")
@@ -695,7 +704,10 @@ def main(argv=None):
     draft.add_argument("--window", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
                        default=BASELINE, help="inclusive UTC merge dates (default: baseline)")
     draft.add_argument("--model", default="gpt-6.2-sol", help="GitHub Copilot CLI model ID (default: %(default)s)")
-    draft.add_argument("--reasoning-effort", choices=REASONING_EFFORTS, default=DEFAULT_REASONING_EFFORT)
+    draft.add_argument("--reasoning-effort", choices=(*REASONING_EFFORTS, "max"), default=DEFAULT_REASONING_EFFORT)
+    draft.add_argument("--editor-model", help="optional second Copilot model to propose edits for the draft model to judge")
+    draft.add_argument("--editor-reasoning-effort", choices=(*REASONING_EFFORTS, "max"),
+                       help="reasoning effort for the second model (default: high)")
     draft.add_argument("--other-bot", action="append", default=[], metavar="LOGIN",
                        help="also exclude review comments from this automation account")
     draft.add_argument("--output-dir", type=Path, default=Path(".scorecard", "instructions"))

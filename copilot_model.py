@@ -10,6 +10,7 @@ from github_data import DataError
 DEFAULT_REASONING_EFFORT = "high"
 MAX_INPUT = 180_000
 REQUEST_TIMEOUT = 180
+MAX_REASONING_REQUEST_TIMEOUT = 600
 CLEANUP_TIMEOUT = 10
 
 
@@ -33,6 +34,7 @@ class Copilot:
     def __init__(self, model, reasoning_effort=DEFAULT_REASONING_EFFORT):
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self._request_timeout = MAX_REASONING_REQUEST_TIMEOUT if reasoning_effort == "max" else REQUEST_TIMEOUT
         self._runner = None
 
     def start(self):
@@ -70,12 +72,12 @@ class Copilot:
     async def _ask(self, instructions, prompt):
         session = None
         try:
-            async with asyncio.timeout(REQUEST_TIMEOUT):
+            async with asyncio.timeout(self._request_timeout):
                 session = await self._client.create_session(
                     model=self.model, reasoning_effort=self.reasoning_effort, available_tools=[],
                     system_message={"mode": "replace", "content": instructions.strip()},
                 )
-                response = await session.send_and_wait(prompt, timeout=REQUEST_TIMEOUT)
+                response = await session.send_and_wait(prompt, timeout=self._request_timeout)
         except (TimeoutError, asyncio.CancelledError):
             if session is not None:
                 await asyncio.wait_for(session.abort(), CLEANUP_TIMEOUT)
@@ -115,6 +117,9 @@ class Copilot:
         self.start()
         try:
             text = self._runner.run(self._ask(instructions, evidence_prompt(data)))
+        except TimeoutError as error:
+            raise AssessmentError(f"{self.model} ({self.reasoning_effort}) timed out after "
+                                  f"{self._request_timeout} seconds") from error
         except self._sdk_errors as error:
             raise AssessmentError(f"Copilot SDK request failed: {error}") from error
         try:
